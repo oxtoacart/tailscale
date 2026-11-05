@@ -55,6 +55,7 @@ import (
 	"tailscale.com/tsconst"
 	"tailscale.com/tstime"
 	"tailscale.com/tstime/mono"
+	"tailscale.com/tstime/rate"
 	"tailscale.com/types/key"
 	"tailscale.com/types/lazy"
 	"tailscale.com/types/logger"
@@ -276,6 +277,10 @@ type Conn struct {
 	// discoAtomic is the current disco private and public keypair for this conn.
 	discoAtomic discoAtomic
 
+	// peerTokenHandler, if non-nil, receives [disco.PeerToken] messages,
+	// including from senders not in the netmap. See [Conn.SetPeerTokenHandler].
+	peerTokenHandler syncs.AtomicValue[func(PeerTokenMessage)]
+
 	// usingCacheNetmap is whether the latest update to self and peersByID are from a cached network map.
 	usingCachedNetmap atomic.Bool
 
@@ -340,6 +345,10 @@ type Conn struct {
 
 	// discoInfo is the state for an active peer DiscoKey.
 	discoInfo map[key.DiscoPublic]*discoInfo
+
+	// peerTokenLimiter rate limits processing of [disco.PeerToken]
+	// messages. It is lazily initialized.
+	peerTokenLimiter *rate.Limiter
 
 	// netInfoFunc is a callback that provides a tailcfg.NetInfo when
 	// discovered network conditions change.
@@ -2250,6 +2259,11 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 	case c.peerMap.knownPeerDiscoKey(sender):
 		di = c.discoInfoForKnownPeerLocked(sender)
 	default:
+		// The only message we accept from unknown senders is a
+		// PeerToken, which may authorize the sender as a new peer.
+		if c.handleUnknownSenderDiscoLocked(msg, sender, src, derpNodeSrc) {
+			return
+		}
 		metricRecvDiscoBadPeer.Add(1)
 		if debugDisco() {
 			c.logf("magicsock: disco: ignoring disco-looking frame, don't know of key %v", sender.ShortString())
@@ -2332,6 +2346,12 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 	}
 
 	switch dm := dm.(type) {
+	case *disco.PeerToken:
+		// A known peer refreshing its token (or one we learned of
+		// via a previous token, renewing it).
+		if fn := c.peerTokenHandler.Load(); fn != nil && !src.vni.IsSet() && c.allowPeerTokenLocked() {
+			c.dispatchPeerTokenLocked(fn, dm, sender, src, derpNodeSrc)
+		}
 	case *disco.Ping:
 		metricRecvDiscoPing.Add(1)
 		c.handlePingLocked(dm, src, di, derpNodeSrc)

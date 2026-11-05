@@ -640,6 +640,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 
 	e.SetPeerByIPPacketFunc(b.lookupPeerByIP)
 	e.SetPeerConfigFunc(b.peerConfig)
+	b.MagicConn().SetPeerTokenHandler(b.handlePeerToken)
 	e.SetPeerForIPFunc(b.PeerForIP)
 	e.SetPeerSessionStateFunc(b.onPeerWireGuardState)
 	e.SetNetLogSource(netLogNodeSource{b})
@@ -2535,7 +2536,6 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	cn := b.currentNode()
 	// Filter the mutations through tailnet lock before applying them.
 	// Unsigned (or invalidly-signed) peers arriving via PeersChanged
 	// ride the delta path as NodeMutationUpsert and would otherwise
@@ -2545,6 +2545,25 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	// any previously-signed peer at that ID is also evicted, matching
 	// the full-netmap behavior of [tkaFilterNetmapLocked].
 	muts = b.tkaFilterDeltaMutsLocked(muts)
+	// Control is authoritative for any node it upserts or removes,
+	// superseding any peer we learned of via a peer token.
+	b.forgetTokenPeersForControlMutsLocked(muts)
+	notify = b.applyNetmapDeltaLocked(muts, true)
+	return true
+}
+
+// applyNetmapDeltaLocked applies muts to the current node's peer state and
+// propagates the changes to magicsock, the WireGuard device, the router and
+// DNS configuration. It returns a Notify for the caller to send (after
+// releasing b.mu), or nil.
+//
+// fromControl reports whether muts came from the control plane, as opposed to
+// being synthesized locally (for peers authorized by a peer token). Only
+// control-sourced mutations are written to the netmap disk cache.
+//
+// b.mu must be held.
+func (b *LocalBackend) applyNetmapDeltaLocked(muts []netmap.NodeMutation, fromControl bool) (notify *ipn.Notify) {
+	cn := b.currentNode()
 	needsAuthReconfig := netmapDeltaNeedsAuthReconfig(cn, muts)
 
 	deltaRes, _ := cn.UpdateNetmapDelta(muts)
@@ -2657,13 +2676,13 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 
 	if cn.NetMap() == nil {
 		b.logf("[unexpected] got node mutations but netmap is nil; mutations not applied")
-		return true
+		return notify
 	}
 
 	// Reaching here, apply any peer changes to the netmap cache (if relevant).
 	// Note we do this AFTER the updates are applied in the nodeBackend, so that
 	// we can get its updated views to put back into the cache.
-	if buildfeatures.HasCacheNetMap &&
+	if buildfeatures.HasCacheNetMap && fromControl &&
 		cn.SelfHasCap(nodecap.CacheNetworkMaps) &&
 		envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") {
 
@@ -2705,7 +2724,7 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 		// LocalBackend after processing deltas.
 		notify = new(ipn.Notify)
 	}
-	return true
+	return notify
 }
 
 func netmapDeltaNeedsAuthReconfig(cn *nodeBackend, muts []netmap.NodeMutation) bool {
@@ -3503,7 +3522,7 @@ func (b *LocalBackend) updateFilterLocked(prefs ipn.PrefsView) {
 		for i := range addrs.Len() {
 			localNetsB.AddPrefix(addrs.At(i))
 		}
-		packetFilter = cn.PacketFilter()
+		packetFilter = cn.packetFilterWithTokenPeerRules()
 
 		// Peers marked UnsignedPeerAPIOnly are exempt from tailnet
 		// lock's signature checks, so make sure control didn't also
@@ -7477,6 +7496,12 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 		}()
 	}
 
+	// Keep the netmap as received from control for the disk cache below;
+	// peers authorized by peer tokens are merged into what we install, but
+	// must never be persisted.
+	controlNetMap := nm
+	nm = b.mergeTokenPeersLocked(nm)
+
 	oldNetMap := b.currentNode().NetMap()
 	oldSelf := oldNetMap.SelfNodeOrZero()
 
@@ -7644,7 +7669,7 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	// the node starts up.
 	if nm != nil {
 		if b.currentNode().SelfHasCap(nodecap.CacheNetworkMaps) && envknob.BoolDefaultTrue("TS_USE_CACHED_NETMAP") {
-			if err := b.writeNetmapToDiskLockedWithPeers(nm); err != nil {
+			if err := b.writeNetmapToDiskLockedWithPeers(controlNetMap); err != nil {
 				b.logf("write netmap to cache: %v", err)
 			}
 		} else {

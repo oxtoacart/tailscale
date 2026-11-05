@@ -150,6 +150,11 @@ func TestMarshalAndParse(t *testing.T) {
 			},
 			want: "09 00 00 00 00 01 00 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f 00 01 02 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f 00 01 02 00 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f 00 00 00 00 00 00 00 7b 00 00 01 c8 00 00 00 00 3b 9a ca 00 00 00 00 0d f8 47 58 00 00 00 00 00 00 00 00 00 00 00 ff ff 01 02 03 04 02 37 20 01 00 00 00 00 00 00 00 00 00 00 00 00 34 56 03 15",
 		},
+		{
+			name: "peer_token",
+			m:    &PeerToken{Token: []byte("a.b.c")},
+			want: "0a 00 61 2e 62 2e 63",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -182,4 +187,23 @@ func mustIPPort(s string) netip.AddrPort {
 		panic(err)
 	}
 	return ipp
+}
+
+func TestParsePeerTokenLimits(t *testing.T) {
+	if _, err := Parse([]byte{byte(TypePeerToken), 0}); err == nil {
+		t.Error("empty PeerToken: want error")
+	}
+	if _, err := Parse([]byte{byte(TypePeerToken), 1, 'x'}); err == nil {
+		t.Error("PeerToken v1: want error")
+	}
+	big := make([]byte, 2+MaxPeerTokenLen+1)
+	big[0] = byte(TypePeerToken)
+	if _, err := Parse(big); err == nil {
+		t.Error("oversized PeerToken: want error")
+	}
+	ok := make([]byte, 2+MaxPeerTokenLen)
+	ok[0] = byte(TypePeerToken)
+	if _, err := Parse(ok); err != nil {
+		t.Errorf("max-size PeerToken: %v", err)
+	}
 }

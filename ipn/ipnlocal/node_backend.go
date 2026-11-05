@@ -164,6 +164,24 @@ type nodeBackend struct {
 	packetFilterRules views.Slice[tailcfg.FilterRule]
 	packetFilter      []filter.Match
 
+	// tokenPeerFilter are the packet filter matches for peers authorized
+	// by peer tokens, derived from the "cap:..." keys of the self node's
+	// CapMap in the most recent full netmap. See
+	// [peertoken.FilterRulesFromSelfCapMap].
+	tokenPeerFilter []filter.Match
+
+	// packetFilterWithTokenPeers caches packetFilter+tokenPeerFilter, so
+	// that [nodeBackend.packetFilterWithTokenPeerRules] returns the same
+	// slice until either input changes (LocalBackend's filter change
+	// detection relies on slice identity). It's nil when stale.
+	packetFilterWithTokenPeers []filter.Match
+
+	// tokenPeers are the peers we learned of via peer tokens rather than
+	// from control, keyed by node ID. Each is also present in peers (and
+	// the indexes derived from it) while its token is valid, unless
+	// control has since told us about the same node ID.
+	tokenPeers map[tailcfg.NodeID]*tokenPeer
+
 	// keyWaitersForTest is the test-only registry of channels waiting for
 	// a given peer key to first appear in the netmap. See
 	// [nodeBackend.AwaitNodeKeyForTest]. It is populated lazily and remains
@@ -668,6 +686,7 @@ func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) (discoChanged []key.Node
 		nb.packetFilter = nil
 		nb.derpMapViewPub.Publish(tailcfg.DERPMapView{})
 	}
+	nb.updateTokenPeerFilterLocked()
 	return discoChanged, routeChanged
 }
 
@@ -1013,6 +1032,7 @@ func (nb *nodeBackend) setPacketFilter(rules views.Slice[tailcfg.FilterRule], pa
 	defer nb.mu.Unlock()
 	nb.packetFilterRules = rules
 	nb.packetFilter = parsed
+	nb.packetFilterWithTokenPeers = nil
 }
 
 // PacketFilter returns the current live packet filter matches.
