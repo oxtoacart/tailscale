@@ -96,6 +96,11 @@ type endpoint struct {
 	endpointState      map[netip.AddrPort]*endpointState // netip.AddrPort type for key (instead of [epAddr]) as [endpointState] is irrelevant for Geneve-encapsulated paths
 	isCallMeMaybeEP    map[netip.AddrPort]bool
 
+	// peerTokenSent is the self peer token last sent to this peer, and
+	// peerTokenSentAt when. See [endpoint.maybeSendPeerTokenLocked].
+	peerTokenSent   *selfPeerToken
+	peerTokenSentAt mono.Time
+
 	// The following fields are related to the new "silent disco"
 	// implementation that's a WIP as of 2022-10-20.
 	// See #540 for background.
@@ -1369,6 +1374,9 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if epDisco == nil {
 		return
 	}
+	// Present our peer token, if any, before the peer sees our pings: it
+	// drops them if it doesn't otherwise know us.
+	de.maybeSendPeerTokenLocked(now, epDisco)
 	if purpose != pingCLI &&
 		!ep.vni.IsSet() { // de.endpointState is only relevant for direct/non-vni epAddr's
 		st, ok := de.endpointState[ep.ap]
@@ -2301,6 +2309,8 @@ func (de *endpoint) invalidateDiscoPathLocked() {
 	de.lastSendExt = 0
 	de.lastFullPing = 0
 	de.lastUDPRelayPathDiscovery = 0
+	de.peerTokenSent = nil
+	de.peerTokenSentAt = 0
 	for _, es := range de.endpointState {
 		es.lastPing = 0
 	}

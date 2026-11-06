@@ -4,6 +4,7 @@
 package magicsock
 
 import (
+	"bytes"
 	"errors"
 	"net/netip"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
+	"tailscale.com/tstime/mono"
 	"tailscale.com/tstime/rate"
 	"tailscale.com/types/key"
 	"tailscale.com/util/clientmetric"
@@ -57,6 +60,7 @@ var (
 	metricRecvDiscoPeerToken            = clientmetric.NewCounter("magicsock_disco_recv_peer_token")
 	metricRecvDiscoPeerTokenUnknownPeer = clientmetric.NewCounter("magicsock_disco_recv_peer_token_unknown_peer")
 	metricRecvDiscoPeerTokenRateLimited = clientmetric.NewCounter("magicsock_disco_recv_peer_token_rate_limited")
+	metricSentDiscoPeerToken            = clientmetric.NewCounter("magicsock_disco_sent_peer_token")
 )
 
 // SetPeerTokenHandler sets the function that is called (in its own
@@ -141,6 +145,10 @@ func (c *Conn) dispatchPeerTokenLocked(fn func(PeerTokenMessage), pt *disco.Peer
 // SendPeerToken sends token, a control-signed peer token, to the peer with
 // node key dst in a [disco.PeerToken] message, over DERP and, if one is
 // known, the peer's best direct path. The peer must be known to c.
+//
+// Callers don't normally need this: c automatically presents the self
+// node's own token (from its [nodecap.PeerToken] capability) to the peers it
+// contacts.
 func (c *Conn) SendPeerToken(dst key.NodePublic, token []byte) error {
 	if len(token) == 0 || len(token) > disco.MaxPeerTokenLen {
 		return errors.New("invalid peer token length")
@@ -159,7 +167,18 @@ func (c *Conn) SendPeerToken(dst key.NodePublic, token []byte) error {
 	derpAddr := ep.derpAddr
 	best := ep.bestAddr.epAddr
 	ep.mu.Unlock()
+	return c.sendPeerToken(dst, epDisco.key(), token, derpAddr, best)
+}
 
+// sendPeerToken sends token to the peer with node key dst and disco key
+// dstDisco, via derpAddr and best, each if valid.
+//
+// Recipients ignore tokens arriving via a UDP relay server, so best isn't
+// used if it's a relay path.
+func (c *Conn) sendPeerToken(dst key.NodePublic, dstDisco key.DiscoPublic, token []byte, derpAddr netip.AddrPort, best epAddr) error {
+	if best.vni.IsSet() {
+		best = epAddr{}
+	}
 	m := &disco.PeerToken{Token: token}
 	var sentAny bool
 	var firstErr error
@@ -167,17 +186,107 @@ func (c *Conn) SendPeerToken(dst key.NodePublic, token []byte) error {
 		if !dstAddr.ap.IsValid() {
 			continue
 		}
-		sent, err := c.sendDiscoMessage(dstAddr, dst, epDisco.key(), m, discoVerboseLog)
+		sent, err := c.sendDiscoMessage(dstAddr, dst, dstDisco, m, discoVerboseLog)
 		sentAny = sentAny || sent
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	if sentAny {
+		metricSentDiscoPeerToken.Add(1)
 		return nil
 	}
 	if firstErr != nil {
 		return firstErr
 	}
 	return errors.New("no path to peer")
+}
+
+// selfPeerToken is this node's own peer token, as given by control in the
+// self node's CapMap under [nodecap.PeerToken].
+type selfPeerToken struct {
+	token []byte // compact serialized JWT; non-empty
+}
+
+// peerTokenCapValue is the JSON form of a [nodecap.PeerToken] value.
+type peerTokenCapValue struct {
+	Token string `json:"token"`
+}
+
+// peerTokenFromSelf returns the self node's own peer token, from the first
+// [nodecap.PeerToken] value in its CapMap with a usable token, or nil if
+// there's none.
+func peerTokenFromSelf(self tailcfg.NodeView) ([]byte, error) {
+	if !self.Valid() {
+		return nil, nil
+	}
+	vals, err := tailcfg.UnmarshalNodeCapViewJSON[peerTokenCapValue](self.CapMap(), nodecap.PeerToken)
+	for _, v := range vals {
+		if n := len(v.Token); n > 0 && n <= disco.MaxPeerTokenLen {
+			return []byte(v.Token), nil
+		}
+	}
+	if err == nil && len(vals) > 0 {
+		err = errors.New("no value has a token of valid length")
+	}
+	return nil, err
+}
+
+// updateSelfPeerTokenLocked updates c.selfPeerToken from self, the new self
+// node. It stores a new pointer only if the token changed. c.mu must be held.
+func (c *Conn) updateSelfPeerTokenLocked(self tailcfg.NodeView) {
+	token, err := peerTokenFromSelf(self)
+	if err != nil {
+		c.logf("magicsock: invalid %s capability: %v", nodecap.PeerToken, err)
+	}
+	old := c.selfPeerToken.Load()
+	switch {
+	case token == nil:
+		if old != nil {
+			c.selfPeerToken.Store(nil)
+		}
+	case old == nil || !bytes.Equal(old.token, token):
+		c.selfPeerToken.Store(&selfPeerToken{token: token})
+	}
+}
+
+// peerTokenResendInterval is how long we go without hearing from a peer
+// before presenting it our (unchanged) peer token again on the next contact
+// attempt. The peer may have restarted and forgotten us, or the earlier
+// message may have been lost or rate limited. It must exceed the granularity
+// with which [endpoint.lastRecvWG] is updated (10s), so that a peer that's
+// actively sending to us doesn't look idle.
+const peerTokenResendInterval = 15 * time.Second
+
+// maybeSendPeerTokenLocked presents our own peer token, if we have one, to
+// the peer de, whose disco info is epDisco, unless we've already sent it the
+// current token and either did so recently or have heard from the peer
+// recently. The message is sent asynchronously.
+//
+// The peer may well already know us from control, in which case it ignores
+// the token. We can't tell, so we send it to every peer we contact.
+//
+// de.mu must be held.
+func (de *endpoint) maybeSendPeerTokenLocked(now mono.Time, epDisco *endpointDisco) {
+	t := de.c.selfPeerToken.Load()
+	if t == nil || epDisco == nil {
+		return
+	}
+	if de.peerTokenSent == t {
+		if now.Sub(de.peerTokenSentAt) < peerTokenResendInterval {
+			return
+		}
+		lastRecv := max(de.lastRecvWG.LoadAtomic(), de.lastRecvUDPAny.LoadAtomic())
+		if now.Sub(lastRecv) < peerTokenResendInterval {
+			return
+		}
+	}
+	de.peerTokenSent = t
+	de.peerTokenSentAt = now
+	dst, dstDisco, derpAddr, best := de.publicKey, epDisco.key(), de.derpAddr, de.bestAddr.epAddr
+	go func() {
+		if err := de.c.sendPeerToken(dst, dstDisco, t.token, derpAddr, best); err != nil {
+			de.c.dlogf("[v1] magicsock: disco: sending peer token to %v: %v", dst.ShortString(), err)
+		}
+	}()
 }
