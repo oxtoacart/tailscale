@@ -14,6 +14,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/peertoken"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
@@ -31,9 +32,11 @@ import (
 // A verified token yields a synthesized [tailcfg.Node] that is injected into
 // the current [nodeBackend] via the same delta path as control's incremental
 // netmap updates, so magicsock, the WireGuard device, the route manager and
-// the packet filter all treat it like any other peer. The node carries the
-// peer capability named by the token, which "cap:..." packet filter rules
-// (from the self node's CapMap) match on. The node is removed when its token
+// the packet filter all treat it like any other peer. The node carries those
+// of the token's capabilities that this node grants (see
+// [peertoken.Claims.GrantedPeerCaps]), which "cap:..." packet filter rules
+// (from the self node's CapMap) match on. The granted capabilities are
+// recomputed with each full netmap. The node is removed when its token
 // expires, unless the peer has sent a newer token by then.
 
 var (
@@ -75,18 +78,20 @@ func (b *LocalBackend) handlePeerToken(m magicsock.PeerTokenMessage) {
 }
 
 // verifyPeerToken verifies token against the signing keys in the self node's
-// CapMap, and checks that self has the "cap:..." CapMap entry named by the
-// token.
-func verifyPeerToken(self tailcfg.NodeView, token string, now time.Time) (*peertoken.Claims, error) {
+// CapMap, and returns its claims and the peer capabilities that self grants
+// it: those of the token's caps that have a "cap:..." entry in self's CapMap.
+// It reports an error if self grants none of them.
+func verifyPeerToken(self tailcfg.NodeView, token string, now time.Time) (*peertoken.Claims, []nodecap.Cap, error) {
 	ks, _ := peertoken.KeySetFromSelfCapMap(self.CapMap())
 	c, err := peertoken.Verify(token, ks, now)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if !self.CapMap().Contains(c.SelfCapMapKey()) {
-		return nil, fmt.Errorf("control did not grant this node %q", c.SelfCapMapKey())
+	granted := c.GrantedPeerCaps(self.CapMap())
+	if len(granted) == 0 {
+		return nil, nil, fmt.Errorf("control granted this node none of the token's caps %q", c.Caps)
 	}
-	return c, nil
+	return c, granted, nil
 }
 
 // acceptPeerTokenLocked implements [LocalBackend.handlePeerToken]. It
@@ -106,7 +111,7 @@ func (b *LocalBackend) acceptPeerTokenLocked(m magicsock.PeerTokenMessage) (*ipn
 		return nil, errors.New("no netmap")
 	}
 	now := b.clock.Now()
-	c, err := verifyPeerToken(nm.SelfNode, m.Token, now)
+	c, granted, err := verifyPeerToken(nm.SelfNode, m.Token, now)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +126,7 @@ func (b *LocalBackend) acceptPeerTokenLocked(m magicsock.PeerTokenMessage) (*ipn
 	}
 
 	nodeID, expiry := c.NodeID, c.Expiry
-	n, renewed, err := cn.recordTokenPeer(c, m, func() tstime.TimerController {
+	n, renewed, err := cn.recordTokenPeer(c, granted, m, func() tstime.TimerController {
 		return b.clock.AfterFunc(expiry.Sub(now), func() { b.expireTokenPeer(cn, nodeID, expiry) })
 	})
 	if err != nil {
@@ -135,8 +140,8 @@ func (b *LocalBackend) acceptPeerTokenLocked(m magicsock.PeerTokenMessage) (*ipn
 	}
 	if !renewed {
 		metricPeerTokenAccepted.Add(1)
-		b.logf("peertoken: accepted peer %v (node %d, %v, cap %q) until %v",
-			c.NodeKey.ShortString(), c.NodeID, c.Addresses, c.PeerCap(), c.Expiry.UTC().Format(time.RFC3339))
+		b.logf("peertoken: accepted peer %v (node %d, %v, caps %q) until %v",
+			c.NodeKey.ShortString(), c.NodeID, c.Addresses, granted, c.Expiry.UTC().Format(time.RFC3339))
 	}
 	return b.applyNetmapDeltaLocked([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: n}}, false), nil
 }
@@ -198,10 +203,10 @@ func (b *LocalBackend) forgetTokenPeersForControlMutsLocked(muts []netmap.NodeMu
 //
 // b.mu must be held.
 func (b *LocalBackend) mergeTokenPeersLocked(nm *netmap.NetworkMap) *netmap.NetworkMap {
-	var verify func(string) (*peertoken.Claims, error)
+	var verify func(string) (*peertoken.Claims, []nodecap.Cap, error)
 	if nm != nil && nm.SelfNode.Valid() && b.tka == nil {
 		now := b.clock.Now()
-		verify = func(token string) (*peertoken.Claims, error) {
+		verify = func(token string) (*peertoken.Claims, []nodecap.Cap, error) {
 			return verifyPeerToken(nm.SelfNode, token, now)
 		}
 	}
@@ -209,14 +214,14 @@ func (b *LocalBackend) mergeTokenPeersLocked(nm *netmap.NetworkMap) *netmap.Netw
 }
 
 // recordTokenPeer records the peer described by the verified claims c,
-// received in m, as a token peer, after checking that it doesn't conflict with
-// any other node in nb.
+// received in m, as a token peer with the peer capabilities granted, after
+// checking that it doesn't conflict with any other node in nb.
 //
 // If a peer must be upserted into nb as a result, it returns its node (and
 // otherwise the zero NodeView). It reports whether the claims renewed an
 // existing token peer. newTimer is called to start the expiry timer for the
 // newly recorded token.
-func (nb *nodeBackend) recordTokenPeer(c *peertoken.Claims, m magicsock.PeerTokenMessage, newTimer func() tstime.TimerController) (_ tailcfg.NodeView, renewed bool, _ error) {
+func (nb *nodeBackend) recordTokenPeer(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerTokenMessage, newTimer func() tstime.TimerController) (_ tailcfg.NodeView, renewed bool, _ error) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	if nb.netMap == nil {
@@ -244,7 +249,7 @@ func (nb *nodeBackend) recordTokenPeer(c *peertoken.Claims, m magicsock.PeerToke
 		return tailcfg.NodeView{}, false, nil
 	}
 
-	n := tokenPeerNode(c, m, prev)
+	n := tokenPeerNode(c, granted, m, prev)
 	if prev != nil {
 		prev.timer.Stop()
 	}
@@ -277,9 +282,10 @@ func checkTokenPeerConflicts(c *peertoken.Claims, self tailcfg.NodeView, nodeByK
 }
 
 // tokenPeerNode synthesizes the peer node for the verified claims c,
-// received in m. If prev is non-nil, it's the token peer being renewed, whose
-// learned endpoints are carried forward if m doesn't supply new ones.
-func tokenPeerNode(c *peertoken.Claims, m magicsock.PeerTokenMessage, prev *tokenPeer) tailcfg.NodeView {
+// received in m, with the peer capabilities granted. If prev is non-nil, it's
+// the token peer being renewed, whose learned endpoints are carried forward if
+// m doesn't supply new ones.
+func tokenPeerNode(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerTokenMessage, prev *tokenPeer) tailcfg.NodeView {
 	n := &tailcfg.Node{
 		ID:                c.NodeID,
 		StableID:          tailcfg.StableNodeID(cmp.Or(c.Subject, fmt.Sprintf("peertoken-%d", c.NodeID))),
@@ -290,7 +296,7 @@ func tokenPeerNode(c *peertoken.Claims, m magicsock.PeerTokenMessage, prev *toke
 		AllowedIPs:        slices.Clone(c.Addresses),
 		Hostinfo:          (&tailcfg.Hostinfo{}).View(),
 		MachineAuthorized: true,
-		CapMap:            tailcfg.NodeCapMap{c.PeerCap(): nil},
+		CapMap:            tokenPeerCapMap(granted),
 		HomeDERP:          tailcfg.DERPRegionID(m.DERPRegion),
 	}
 	if m.UDPSrc.IsValid() {
@@ -305,6 +311,29 @@ func tokenPeerNode(c *peertoken.Claims, m magicsock.PeerTokenMessage, prev *toke
 		}
 	}
 	return n.View()
+}
+
+// tokenPeerCapMap returns the CapMap for a token peer granted the given peer
+// capabilities.
+func tokenPeerCapMap(granted []nodecap.Cap) tailcfg.NodeCapMap {
+	m := make(tailcfg.NodeCapMap, len(granted))
+	for _, c := range granted {
+		m[c] = nil
+	}
+	return m
+}
+
+// withGrantedCaps returns n with its CapMap replaced by the given granted
+// peer capabilities, or n itself if it already has exactly those.
+func withGrantedCaps(n tailcfg.NodeView, granted []nodecap.Cap) tailcfg.NodeView {
+	if n.CapMap().Len() == len(granted) && !slices.ContainsFunc(granted, func(c nodecap.Cap) bool {
+		return !n.CapMap().Contains(c)
+	}) {
+		return n
+	}
+	ns := n.AsStruct()
+	ns.CapMap = tokenPeerCapMap(granted)
+	return ns.View()
 }
 
 // forgetExpiredTokenPeer forgets the token peer with the given ID if its
@@ -333,8 +362,10 @@ func (nb *nodeBackend) forgetTokenPeerLocked(id tailcfg.NodeID) {
 }
 
 // mergeTokenPeers implements [LocalBackend.mergeTokenPeersLocked]. If verify
-// is nil, all token peers are forgotten.
-func (nb *nodeBackend) mergeTokenPeers(nm *netmap.NetworkMap, verify func(token string) (*peertoken.Claims, error)) *netmap.NetworkMap {
+// is nil, all token peers are forgotten. Otherwise verify reports the peer
+// capabilities granted to each token peer under nm, and the peer's node is
+// updated to carry exactly those.
+func (nb *nodeBackend) mergeTokenPeers(nm *netmap.NetworkMap, verify func(token string) (*peertoken.Claims, []nodecap.Cap, error)) *netmap.NetworkMap {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
 	if len(nb.tokenPeers) == 0 {
@@ -376,7 +407,8 @@ func (nb *nodeBackend) mergeTokenPeers(nm *netmap.NetworkMap, verify func(token 
 			drop.Make()
 			drop.Add(id)
 		}
-		if _, err := verify(tp.token); err != nil {
+		_, granted, err := verify(tp.token)
+		if err != nil {
 			nb.logf("peertoken: dropping peer %d: %v", id, err)
 			nb.forgetTokenPeerLocked(id)
 			continue
@@ -386,6 +418,7 @@ func (nb *nodeBackend) mergeTokenPeers(nm *netmap.NetworkMap, verify func(token 
 			nb.forgetTokenPeerLocked(id)
 			continue
 		}
+		tp.node = withGrantedCaps(tp.node, granted)
 		add = append(add, tp.node)
 	}
 	if len(add) == 0 && len(drop) == 0 {

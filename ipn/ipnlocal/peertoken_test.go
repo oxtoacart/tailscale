@@ -23,7 +23,22 @@ import (
 	"tailscale.com/wgengine/magicsock"
 )
 
-const testPeerCap = "example.com/cap/widget"
+const (
+	testPeerCap  = "example.com/cap/widget"
+	testPeerCap2 = "example.com/cap/gadget" // grants port 80, with port80Rule
+)
+
+// port80Rule returns the self CapMap value granting peers with testPeerCap2
+// access to TCP port 80 on self.
+func (pt *peerTokenTest) port80Rule() []tailcfg.RawMessage {
+	return []tailcfg.RawMessage{tailcfg.RawMessage(fmt.Sprintf(
+		`{"SrcIPs":["*"],"DstPorts":[{"IP":%q,"Ports":{"First":80,"Last":80}}]}`, pt.selfIP))}
+}
+
+// withCaps returns a token mutation setting its caps.
+func withCaps(caps ...string) func(map[string]any) {
+	return func(c map[string]any) { c["caps"] = caps }
+}
 
 type peerTokenTest struct {
 	t       *testing.T
@@ -112,7 +127,7 @@ func (pt *peerTokenTest) token(p tokenPeerIdentity, ttl time.Duration, mutate ..
 		"node_key":  p.node,
 		"disco_key": p.disco,
 		"addresses": []netip.Prefix{netip.PrefixFrom(p.ip, 32)},
-		"cap":       "cap:" + testPeerCap,
+		"caps":      []string{"cap:" + testPeerCap},
 	}
 	for _, f := range mutate {
 		f(claims)
@@ -227,7 +242,7 @@ func TestPeerTokenReject(t *testing.T) {
 			return viaDERP(p, pt.token(p, -time.Second))
 		}},
 		{"cap_not_granted_to_self", func(pt *peerTokenTest, p tokenPeerIdentity) magicsock.PeerTokenMessage {
-			return viaDERP(p, pt.token(p, time.Hour, func(c map[string]any) { c["cap"] = "cap:example.com/cap/other" }))
+			return viaDERP(p, pt.token(p, time.Hour, func(c map[string]any) { c["caps"] = []string{"cap:example.com/cap/other"} }))
 		}},
 		{"address_of_control_peer", func(pt *peerTokenTest, p tokenPeerIdentity) magicsock.PeerTokenMessage {
 			return viaDERP(p, pt.token(p, time.Hour, func(c map[string]any) { c["addresses"] = []string{"100.64.0.50/32"} }))
@@ -454,4 +469,69 @@ func TestPeerTokenFullNetmap(t *testing.T) {
 			t.Fatal("token peers not forgotten when netmap cleared")
 		}
 	})
+}
+
+func TestPeerTokenMultipleCaps(t *testing.T) {
+	pt := newPeerTokenTest(t)
+	b := pt.b
+	p := newTokenPeerIdentity(100, "100.64.0.100")
+
+	// The token lists three caps, of which self grants only testPeerCap.
+	b.handlePeerToken(viaDERP(p, pt.token(p, time.Hour,
+		withCaps("cap:"+testPeerCap, "cap:"+testPeerCap2, "cap:example.com/cap/ungranted"))))
+	if !pt.present(p) {
+		t.Fatal("token peer not added")
+	}
+	checkCaps := func(want ...nodecap.Cap) {
+		t.Helper()
+		n, ok := b.currentNode().NodeByID(p.id)
+		if !ok {
+			t.Fatal("token peer missing")
+		}
+		if n.CapMap().Len() != len(want) {
+			t.Errorf("peer CapMap = %v; want exactly %q", n.CapMap(), want)
+		}
+		for _, c := range want {
+			if !n.HasCap(c) {
+				t.Errorf("peer CapMap = %v; want %q", n.CapMap(), c)
+			}
+		}
+	}
+	checkPorts := func(want22, want80 filter.Response) {
+		t.Helper()
+		f := b.currentNode().filter()
+		if got := f.CheckTCP(p.ip, pt.selfIP, 22); got != want22 {
+			t.Errorf("port 22 = %v; want %v", got, want22)
+		}
+		if got := f.CheckTCP(p.ip, pt.selfIP, 80); got != want80 {
+			t.Errorf("port 80 = %v; want %v", got, want80)
+		}
+	}
+	checkCaps(testPeerCap)
+	checkPorts(filter.Accept, filter.Drop)
+
+	// Control now grants self testPeerCap2 too: the peer gains it with the
+	// next full netmap, without presenting its token again.
+	caps := pt.selfCapMap()
+	caps["cap:"+testPeerCap2] = pt.port80Rule()
+	pt.setNetMap(caps, nil)
+	checkCaps(testPeerCap, testPeerCap2)
+	checkPorts(filter.Accept, filter.Accept)
+
+	// Then control revokes testPeerCap: the peer stays, with just
+	// testPeerCap2.
+	delete(caps, "cap:"+testPeerCap)
+	pt.setNetMap(caps, nil)
+	if !pt.present(p) {
+		t.Fatal("token peer dropped though self still grants one of its caps")
+	}
+	checkCaps(testPeerCap2)
+	checkPorts(filter.Drop, filter.Accept)
+
+	// Reinstalling the current netmap leaves the peer as it is.
+	b.DebugForceNetmapUpdate()
+	if got := len(b.currentNode().Peers()); got != 1 {
+		t.Fatalf("got %d peers; want 1", got)
+	}
+	checkCaps(testPeerCap2)
 }

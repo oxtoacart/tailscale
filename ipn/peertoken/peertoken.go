@@ -17,11 +17,13 @@
 // the WireGuard handshake then proves possession of [Claims.NodeKey]. A stolen
 // token is thus useless without the corresponding private keys.
 //
-// The token grants the peer the node capability named in [Claims.Cap], which
-// has the form "cap:<peer-node-capability>". A recipient only accepts the
-// token if its own self node's CapMap contains that same "cap:..." key; the
-// values under that key are the [tailcfg.FilterRule]s governing what the
-// peer may access. See [FilterRulesFromSelfCapMap].
+// The token lists, in [Claims.Caps], the node capabilities it may grant the
+// peer, each of the form "cap:<peer-node-capability>". A recipient only
+// accepts the token if its own self node's CapMap contains at least one of
+// those same "cap:..." keys, and grants the peer only the capabilities whose
+// keys it contains (see [Claims.GrantedPeerCaps]). The values under each such
+// key are the [tailcfg.FilterRule]s governing what peers with that
+// capability may access. See [FilterRulesFromSelfCapMap].
 //
 // [disco.PeerToken]: https://pkg.go.dev/tailscale.com/disco#PeerToken
 package peertoken
@@ -47,8 +49,9 @@ import (
 	"tailscale.com/types/views"
 )
 
-// CapPrefix is the prefix of [Claims.Cap] and of the corresponding self node
-// CapMap key holding the packet filter rules for peers with that capability.
+// CapPrefix is the prefix of each of [Claims.Caps] and of the corresponding
+// self node CapMap key holding the packet filter rules for peers with that
+// capability.
 const CapPrefix = "cap:"
 
 // NotBeforeLeeway is how far in the future a token's "nbf" or "iat" may be,
@@ -88,22 +91,33 @@ type Claims struct {
 	// peer is allowed to originate traffic from exactly these addresses.
 	Addresses []netip.Prefix `json:"addresses"`
 
-	// Cap is the node capability granted to the peer, of the form
-	// "cap:<peer-node-capability>". Required.
-	Cap string `json:"cap"`
+	// Caps are the node capabilities the token may grant the peer, each of
+	// the form "cap:<peer-node-capability>". At least one is required.
+	//
+	// A recipient grants the peer only those of Caps whose "cap:..." key is
+	// in its own self node's CapMap; see [Claims.GrantedPeerCaps].
+	Caps []string `json:"caps"`
 }
 
-// PeerCap returns the peer node capability named by c.Cap, without the
-// "cap:" prefix. That's the capability the peer's synthesized node carries
-// and that "cap:..." filter rule sources match.
-func (c *Claims) PeerCap() nodecap.Cap {
-	return nodecap.Cap(strings.TrimPrefix(c.Cap, CapPrefix))
-}
-
-// SelfCapMapKey returns the self node CapMap key that must be present for a
-// token with these claims to be accepted. It is c.Cap verbatim.
-func (c *Claims) SelfCapMapKey() nodecap.Cap {
-	return nodecap.Cap(c.Cap)
+// GrantedPeerCaps returns the peer node capabilities that a recipient whose
+// self node has the given CapMap grants to the peer: those of c.Caps whose
+// "cap:..." key is in selfCapMap, without the "cap:" prefix. Those are the
+// capabilities the peer's synthesized node carries, and that "cap:..." filter
+// rule sources match.
+//
+// The result is sorted and has no duplicates. It's empty if the recipient
+// grants none of c.Caps, in which case it must reject the token.
+func (c *Claims) GrantedPeerCaps(selfCapMap views.MapSlice[nodecap.Cap, tailcfg.RawMessage]) []nodecap.Cap {
+	var caps []nodecap.Cap
+	for _, k := range c.Caps {
+		peerCap, ok := strings.CutPrefix(k, CapPrefix)
+		if !ok || peerCap == "" || !selfCapMap.Contains(nodecap.Cap(k)) {
+			continue
+		}
+		caps = append(caps, nodecap.Cap(peerCap))
+	}
+	slices.Sort(caps)
+	return slices.Compact(caps)
 }
 
 // KeySet is a set of trusted peer token signing keys, indexed by key ID.
@@ -304,9 +318,13 @@ func (c *Claims) validate(now time.Time) error {
 			return fmt.Errorf("invalid address %v: must be a single Tailscale IP", p)
 		}
 	}
-	peerCap, ok := strings.CutPrefix(c.Cap, CapPrefix)
-	if !ok || peerCap == "" {
-		return fmt.Errorf("invalid cap %q: must be of the form %q", c.Cap, CapPrefix+"<peer-node-capability>")
+	if len(c.Caps) == 0 {
+		return errors.New("missing caps")
+	}
+	for _, k := range c.Caps {
+		if peerCap, ok := strings.CutPrefix(k, CapPrefix); !ok || peerCap == "" {
+			return fmt.Errorf("invalid cap %q: must be of the form %q", k, CapPrefix+"<peer-node-capability>")
+		}
 	}
 	return nil
 }

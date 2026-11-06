@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +87,7 @@ func validClaims() map[string]any {
 		"node_key":  key.NewNode().Public(),
 		"disco_key": key.NewDisco().Public(),
 		"addresses": []string{"100.64.1.2/32", "fd7a:115c:a1e0::1:2/128"},
-		"cap":       "cap:example.com/cap/widget",
+		"caps":      []string{"cap:example.com/cap/widget", "cap:example.com/cap/gadget"},
 	}
 }
 
@@ -108,11 +109,8 @@ func TestVerify(t *testing.T) {
 	if !got.Expiry.Equal(testNow.Add(time.Hour)) {
 		t.Errorf("Expiry = %v", got.Expiry)
 	}
-	if got.PeerCap() != "example.com/cap/widget" {
-		t.Errorf("PeerCap = %q", got.PeerCap())
-	}
-	if got.SelfCapMapKey() != "cap:example.com/cap/widget" {
-		t.Errorf("SelfCapMapKey = %q", got.SelfCapMapKey())
+	if want := []string{"cap:example.com/cap/widget", "cap:example.com/cap/gadget"}; !slices.Equal(got.Caps, want) {
+		t.Errorf("Caps = %q; want %q", got.Caps, want)
 	}
 	if got.Subject != "nStable1" {
 		t.Errorf("Subject = %q", got.Subject)
@@ -147,8 +145,13 @@ func TestVerifyRejects(t *testing.T) {
 		{"no_addresses", func() string { return s.sign(t, with("addresses", nil)) }, "addresses"},
 		{"non_tailscale_addr", func() string { return s.sign(t, with("addresses", []string{"10.0.0.1/32"})) }, "invalid address"},
 		{"subnet_addr", func() string { return s.sign(t, with("addresses", []string{"100.64.0.0/24"})) }, "invalid address"},
-		{"cap_no_prefix", func() string { return s.sign(t, with("cap", "example.com/cap/widget")) }, "invalid cap"},
-		{"cap_empty", func() string { return s.sign(t, with("cap", "cap:")) }, "invalid cap"},
+		{"no_caps", func() string { return s.sign(t, with("caps", nil)) }, "missing caps"},
+		{"empty_caps", func() string { return s.sign(t, with("caps", []string{})) }, "missing caps"},
+		{"caps_not_list", func() string { return s.sign(t, with("caps", "cap:example.com/cap/widget")) }, "parsing claims"},
+		{"cap_no_prefix", func() string {
+			return s.sign(t, with("caps", []string{"cap:example.com/cap/widget", "example.com/cap/gadget"}))
+		}, "invalid cap"},
+		{"cap_empty", func() string { return s.sign(t, with("caps", []string{"cap:"})) }, "invalid cap"},
 		{"unknown_kid", func() string { return newTestSigner(t, "other").sign(t, validClaims()) }, "unknown signing key"},
 		{"wrong_key_same_kid", func() string { return newTestSigner(t, "k1").sign(t, validClaims()) }, "invalid signature"},
 		{"tampered_payload", func() string {
@@ -243,5 +246,31 @@ func TestFilterRulesFromSelfCapMap(t *testing.T) {
 	}
 	if rules[1].DstPorts[0].Ports.First != 22 {
 		t.Errorf("rules[1] lost DstPorts: %+v", rules[1])
+	}
+}
+
+func TestGrantedPeerCaps(t *testing.T) {
+	c := &Claims{Caps: []string{
+		"cap:example.com/cap/b",
+		"cap:example.com/cap/a",
+		"cap:example.com/cap/unknown",
+		"cap:example.com/cap/a", // duplicate
+		"example.com/cap/c",     // no prefix; never granted
+		"cap:",                  // empty; never granted
+	}}
+	selfCapMap := views.MapSliceOf(tailcfg.NodeCapMap{
+		"cap:example.com/cap/a": nil,
+		"cap:example.com/cap/b": nil,
+		"example.com/cap/c":     nil,
+		"cap:":                  nil,
+		"cap:example.com/cap/z": nil, // not in token
+	})
+	want := []nodecap.Cap{"example.com/cap/a", "example.com/cap/b"}
+	if got := c.GrantedPeerCaps(selfCapMap); !slices.Equal(got, want) {
+		t.Errorf("GrantedPeerCaps = %q; want %q", got, want)
+	}
+
+	if got := c.GrantedPeerCaps(views.MapSliceOf(tailcfg.NodeCapMap{"cap:example.com/cap/z": nil})); len(got) != 0 {
+		t.Errorf("GrantedPeerCaps with no matching keys = %q; want none", got)
 	}
 }
