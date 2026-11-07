@@ -426,6 +426,14 @@ type LocalBackend struct {
 	tkaSyncLock syncs.Mutex
 	clock       tstime.Clock
 
+	// peerLookupFuncForTest, if non-nil, replaces the peer lookup RPC to
+	// control (see peerlookup.go).
+	peerLookupFuncForTest func(context.Context, *tailcfg.PeerLookupRequest) (*tailcfg.PeerLookupResponse, error)
+
+	// sinceLastSendForTest, if non-nil, replaces
+	// [magicsock.Conn.SinceLastSendToNodeKey] for peer lookups.
+	sinceLastSendForTest func(key.NodePublic) (time.Duration, bool)
+
 	// Last ClientVersion received in MapResponse, guarded by mu.
 	lastClientVersion *tailcfg.ClientVersion
 
@@ -2547,7 +2555,7 @@ func (b *LocalBackend) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bo
 	muts = b.tkaFilterDeltaMutsLocked(muts)
 	// Control is authoritative for any node it upserts or removes,
 	// superseding any peer we learned of via a peer token.
-	b.forgetTokenPeersForControlMutsLocked(muts)
+	b.forgetLocalPeersForControlMutsLocked(muts)
 	notify = b.applyNetmapDeltaLocked(muts, true)
 	return true
 }
@@ -4828,6 +4836,10 @@ func (b *LocalBackend) StartLoginInteractiveAs(ctx context.Context, user ipnauth
 }
 
 func (b *LocalBackend) Ping(ctx context.Context, ip netip.Addr, pingType tailcfg.PingType, size int) (*ipnstate.PingResult, error) {
+	if nb := b.currentNode(); !nb.HasNodeAddr(ip) {
+		// Control may not have told us about the peer; ask it.
+		b.lookupPeerWait(ctx, nb, peerLookupQuery{ip: ip})
+	}
 	if pingType == tailcfg.PingPeerAPI {
 		t0 := b.clock.Now()
 		node, base, err := b.pingPeerAPI(ctx, ip)
@@ -7500,7 +7512,7 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 	// peers authorized by peer tokens are merged into what we install, but
 	// must never be persisted.
 	controlNetMap := nm
-	nm = b.mergeTokenPeersLocked(nm)
+	nm = b.mergeLocalPeersLocked(nm)
 
 	oldNetMap := b.currentNode().NetMap()
 	oldSelf := oldNetMap.SelfNodeOrZero()

@@ -38,6 +38,11 @@ import (
 // (from the self node's CapMap) match on. The granted capabilities are
 // recomputed with each full netmap. The node is removed when its token
 // expires, unless the peer has sent a newer token by then.
+//
+// Peers that this node looks up with control's peer lookup RPC (see
+// peerlookup.go) are injected the same way. Each such "local" peer (one we,
+// rather than control, put in the netmap) is a [localPeer], from a token, a
+// lookup or both, and stays until neither remains valid.
 
 var (
 	metricPeerTokenAccepted = clientmetric.NewCounter("localbackend_peer_token_accepted")
@@ -48,12 +53,101 @@ var (
 
 var errPeerTokenTailnetLock = errors.New("tailnet lock is enabled; peer tokens signed by control are not trusted")
 
-// tokenPeer is a peer authorized by a peer token.
-type tokenPeer struct {
-	claims *peertoken.Claims
-	token  string
-	node   tailcfg.NodeView // as injected into nodeBackend.peers
-	timer  tstime.TimerController
+// localPeer is a peer that this node, rather than control, put in its
+// netmap: one that presented a valid peer token, one that this node looked up
+// with control's peer lookup RPC, or both.
+type localPeer struct {
+	// claims, if non-nil, are those of the peer's current token, from which
+	// tokenNode was synthesized. tokenTimer fires when the token expires.
+	claims     *peertoken.Claims
+	token      string
+	tokenNode  tailcfg.NodeView
+	tokenTimer tstime.TimerController
+
+	// lookupNode, if valid, is the peer as returned by a peer lookup, which
+	// may be used until lookupExpiry, when lookupTimer fires.
+	lookupNode   tailcfg.NodeView
+	lookupExpiry time.Time
+	lookupTimer  tstime.TimerController
+
+	node tailcfg.NodeView // as injected into nodeBackend.peers; see localPeerNode
+}
+
+// clearToken forgets lp's token, if any.
+func (lp *localPeer) clearToken() {
+	if lp.tokenTimer != nil {
+		lp.tokenTimer.Stop()
+	}
+	lp.claims, lp.token, lp.tokenNode, lp.tokenTimer = nil, "", tailcfg.NodeView{}, nil
+}
+
+// clearLookup forgets lp's lookup result, if any.
+func (lp *localPeer) clearLookup() {
+	if lp.lookupTimer != nil {
+		lp.lookupTimer.Stop()
+	}
+	lp.lookupNode, lp.lookupExpiry, lp.lookupTimer = tailcfg.NodeView{}, time.Time{}, nil
+}
+
+// empty reports whether lp has neither a token nor a lookup result, and so
+// should be forgotten.
+func (lp *localPeer) empty() bool {
+	return lp.claims == nil && !lp.lookupNode.Valid()
+}
+
+// localPeerNode returns the node to inject for a local peer with the given
+// token and lookup nodes, either of which may be invalid (but not both).
+//
+// With both, it's the looked-up node (which has the peer's name, real key
+// expiry, home DERP region and endpoints, from control), with the token's
+// granted capabilities (which the packet filter matches inbound traffic from
+// the peer on), and any endpoint we learned from the token's disco message.
+func localPeerNode(tokenNode, lookupNode tailcfg.NodeView) tailcfg.NodeView {
+	switch {
+	case !lookupNode.Valid():
+		return tokenNode
+	case !tokenNode.Valid():
+		return lookupNode
+	}
+	n := lookupNode.AsStruct()
+	n.CapMap = tokenNode.CapMap().AsMap()
+	for _, ep := range tokenNode.Endpoints().All() {
+		if !slices.Contains(n.Endpoints, ep) {
+			n.Endpoints = append(n.Endpoints, ep)
+		}
+	}
+	if n.HomeDERP == 0 {
+		n.HomeDERP = tokenNode.HomeDERP()
+	}
+	return n.View()
+}
+
+// sameKeys reports whether a and b have the same node and disco keys. If a
+// local peer's token and lookup result don't, the peer has changed keys
+// since one of them, so the older one should be forgotten.
+func sameKeys(a, b tailcfg.NodeView) bool {
+	return a.Key() == b.Key() && a.DiscoKey() == b.DiscoKey()
+}
+
+// localPeerChangedLocked updates the local peer lp with node ID id, after a
+// change to its token or lookup result, and returns the mutation (if any) to
+// apply to nb's peers as a result. If lp is now empty, it's forgotten and the
+// peer removed. nb.mu must be held.
+func (nb *nodeBackend) localPeerChangedLocked(id tailcfg.NodeID, lp *localPeer) netmap.NodeMutation {
+	_, present := nb.peers[id]
+	if lp.empty() {
+		delete(nb.localPeers, id)
+		if !present {
+			return nil
+		}
+		return netmap.MakeNodeMutationRemove(id)
+	}
+	old := lp.node
+	lp.node = localPeerNode(lp.tokenNode, lp.lookupNode)
+	if !present || old.Equal(lp.node) {
+		return nil
+	}
+	return netmap.NodeMutationUpsert{Node: lp.node}
 }
 
 // handlePeerToken is the [magicsock.Conn] peer token handler. It verifies the
@@ -162,47 +256,48 @@ func (b *LocalBackend) expireTokenPeer(nb *nodeBackend, id tailcfg.NodeID, expir
 	if b.currentNode() != nb {
 		return
 	}
-	stillPresent, ok := nb.forgetExpiredTokenPeer(id, expiry)
+	mut, ok := nb.forgetExpiredTokenPeer(id, expiry)
 	if !ok {
 		return
 	}
 	metricPeerTokenExpired.Add(1)
 	b.logf("peertoken: token for node %d expired", id)
-	if stillPresent {
-		notify = b.applyNetmapDeltaLocked([]netmap.NodeMutation{netmap.MakeNodeMutationRemove(id)}, false)
+	if mut != nil {
+		notify = b.applyNetmapDeltaLocked([]netmap.NodeMutation{mut}, false)
 	}
 }
 
-// forgetTokenPeersForControlMutsLocked drops any token peers whose node IDs
+// forgetLocalPeersForControlMutsLocked drops any local peers whose node IDs
 // control upserts or removes in muts. Control is authoritative for those
 // nodes from now on, so the mutations are applied as-is; we merely stop
 // managing (and expiring) them ourselves.
 //
 // b.mu must be held.
-func (b *LocalBackend) forgetTokenPeersForControlMutsLocked(muts []netmap.NodeMutation) {
+func (b *LocalBackend) forgetLocalPeersForControlMutsLocked(muts []netmap.NodeMutation) {
 	cn := b.currentNode()
 	cn.mu.Lock()
 	defer cn.mu.Unlock()
-	if len(cn.tokenPeers) == 0 {
+	if len(cn.localPeers) == 0 {
 		return
 	}
 	for _, m := range muts {
 		switch m.(type) {
 		case netmap.NodeMutationUpsert, netmap.NodeMutationRemove:
-			cn.forgetTokenPeerLocked(m.NodeIDBeingMutated())
+			cn.forgetLocalPeerLocked(m.NodeIDBeingMutated())
 		}
 	}
 }
 
-// mergeTokenPeersLocked returns nm with the current token peers that remain
-// valid added to nm.Peers, for installing as the new full netmap. Token peers
-// that are no longer valid under nm (expired, signing key or capability
-// revoked, superseded or conflicting with a peer from control, or tailnet lock
-// enabled) are forgotten. It returns nm unmodified if there's nothing to
-// merge; otherwise a shallow copy.
+// mergeLocalPeersLocked returns nm with the current local peers that remain
+// valid added to nm.Peers, for installing as the new full netmap. Tokens that
+// are no longer valid under nm (expired, or signing key or capability
+// revoked) are forgotten, as are local peers that are superseded by or
+// conflict with a peer from control, and all local peers if tailnet lock is
+// enabled. It returns nm unmodified if there's nothing to merge; otherwise a
+// shallow copy.
 //
 // b.mu must be held.
-func (b *LocalBackend) mergeTokenPeersLocked(nm *netmap.NetworkMap) *netmap.NetworkMap {
+func (b *LocalBackend) mergeLocalPeersLocked(nm *netmap.NetworkMap) *netmap.NetworkMap {
 	var verify func(string) (*peertoken.Claims, []nodecap.Cap, error)
 	if nm != nil && nm.SelfNode.Valid() && b.tka == nil {
 		now := b.clock.Now()
@@ -210,7 +305,7 @@ func (b *LocalBackend) mergeTokenPeersLocked(nm *netmap.NetworkMap) *netmap.Netw
 			return verifyPeerToken(nm.SelfNode, token, now)
 		}
 	}
-	return b.currentNode().mergeTokenPeers(nm, verify)
+	return b.currentNode().mergeLocalPeers(nm, verify)
 }
 
 // recordTokenPeer records the peer described by the verified claims c,
@@ -228,10 +323,10 @@ func (nb *nodeBackend) recordTokenPeer(c *peertoken.Claims, granted []nodecap.Ca
 		return tailcfg.NodeView{}, false, errors.New("no netmap")
 	}
 
-	// A tokenPeers entry means we (not control) manage the node with that
+	// A localPeers entry means we (not control) manage the node with that
 	// ID: control upserts and removes clear the entry.
-	prev := nb.tokenPeers[c.NodeID]
-	if p, ok := nb.peers[c.NodeID]; ok && prev == nil {
+	lp := nb.localPeers[c.NodeID]
+	if p, ok := nb.peers[c.NodeID]; ok && lp == nil {
 		// The node ID is that of a peer from control.
 		if p.Key() == c.NodeKey {
 			// We already know this peer from control. Nothing to do.
@@ -239,42 +334,47 @@ func (nb *nodeBackend) recordTokenPeer(c *peertoken.Claims, granted []nodecap.Ca
 		}
 		return tailcfg.NodeView{}, false, fmt.Errorf("node ID %d belongs to a different node in the netmap", c.NodeID)
 	}
-	if err := checkTokenPeerConflicts(c, nb.netMap.SelfNode, nb.nodeByKey, nb.nodeByAddr); err != nil {
+	if err := checkLocalPeerConflicts(c.NodeID, c.NodeKey, c.Addresses, nb.netMap.SelfNode, nb.nodeByKey, nb.nodeByAddr); err != nil {
 		return tailcfg.NodeView{}, false, err
 	}
 
-	if prev != nil && !c.Expiry.After(prev.claims.Expiry) {
+	if lp != nil && lp.claims != nil && !c.Expiry.After(lp.claims.Expiry) {
 		// Not newer than the token we have; perhaps a retransmission or
 		// replay. Ignore it.
 		return tailcfg.NodeView{}, false, nil
 	}
 
-	n := tokenPeerNode(c, granted, m, prev)
-	if prev != nil {
-		prev.timer.Stop()
+	if lp == nil {
+		lp = new(localPeer)
+		mak.Set(&nb.localPeers, c.NodeID, lp)
 	}
-	mak.Set(&nb.tokenPeers, c.NodeID, &tokenPeer{
-		claims: c,
-		token:  m.Token,
-		node:   n,
-		timer:  newTimer(),
-	})
-	return n, prev != nil, nil
+	renewed = lp.claims != nil
+	prevTokenNode := lp.tokenNode
+	lp.clearToken()
+	lp.claims, lp.token = c, m.Token
+	lp.tokenNode = tokenPeerNode(c, granted, m, prevTokenNode)
+	lp.tokenTimer = newTimer()
+	if lp.lookupNode.Valid() && !sameKeys(lp.lookupNode, lp.tokenNode) {
+		// The peer's keys changed since we looked it up.
+		lp.clearLookup()
+	}
+	lp.node = localPeerNode(lp.tokenNode, lp.lookupNode)
+	return lp.node, renewed, nil
 }
 
-// checkTokenPeerConflicts reports an error if the peer described by c
-// would collide with self or with another node (by node key or address), as
-// indexed by nodeByKey and nodeByAddr. Index entries for c.NodeID itself
-// don't count as conflicts.
-func checkTokenPeerConflicts(c *peertoken.Claims, self tailcfg.NodeView, nodeByKey map[key.NodePublic]tailcfg.NodeID, nodeByAddr map[netip.Addr]tailcfg.NodeID) error {
-	if self.Valid() && (self.ID() == c.NodeID || self.Key() == c.NodeKey) {
-		return errors.New("token describes this node")
+// checkLocalPeerConflicts reports an error if the local peer with the given
+// node ID, node key and addresses would collide with self or with another
+// node (by node key or address), as indexed by nodeByKey and nodeByAddr.
+// Index entries for nodeID itself don't count as conflicts.
+func checkLocalPeerConflicts(nodeID tailcfg.NodeID, nodeKey key.NodePublic, addrs []netip.Prefix, self tailcfg.NodeView, nodeByKey map[key.NodePublic]tailcfg.NodeID, nodeByAddr map[netip.Addr]tailcfg.NodeID) error {
+	if self.Valid() && (self.ID() == nodeID || self.Key() == nodeKey) {
+		return errors.New("peer is this node")
 	}
-	if id, ok := nodeByKey[c.NodeKey]; ok && id != c.NodeID {
-		return fmt.Errorf("node key %v belongs to node %d", c.NodeKey.ShortString(), id)
+	if id, ok := nodeByKey[nodeKey]; ok && id != nodeID {
+		return fmt.Errorf("node key %v belongs to node %d", nodeKey.ShortString(), id)
 	}
-	for _, p := range c.Addresses {
-		if id, ok := nodeByAddr[p.Addr()]; ok && id != c.NodeID {
+	for _, p := range addrs {
+		if id, ok := nodeByAddr[p.Addr()]; ok && id != nodeID {
 			return fmt.Errorf("address %v belongs to node %d", p.Addr(), id)
 		}
 	}
@@ -282,10 +382,10 @@ func checkTokenPeerConflicts(c *peertoken.Claims, self tailcfg.NodeView, nodeByK
 }
 
 // tokenPeerNode synthesizes the peer node for the verified claims c,
-// received in m, with the peer capabilities granted. If prev is non-nil, it's
-// the token peer being renewed, whose learned endpoints are carried forward if
-// m doesn't supply new ones.
-func tokenPeerNode(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerTokenMessage, prev *tokenPeer) tailcfg.NodeView {
+// received in m, with the peer capabilities granted. If prev is valid, it's
+// the node from the token being renewed, whose learned endpoints are carried
+// forward if m doesn't supply new ones.
+func tokenPeerNode(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerTokenMessage, prev tailcfg.NodeView) tailcfg.NodeView {
 	n := &tailcfg.Node{
 		ID:                c.NodeID,
 		StableID:          tailcfg.StableNodeID(cmp.Or(c.Subject, fmt.Sprintf("peertoken-%d", c.NodeID))),
@@ -302,12 +402,12 @@ func tokenPeerNode(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerT
 	if m.UDPSrc.IsValid() {
 		n.Endpoints = []netip.AddrPort{m.UDPSrc}
 	}
-	if prev != nil {
+	if prev.Valid() {
 		if n.HomeDERP == 0 {
-			n.HomeDERP = prev.node.HomeDERP()
+			n.HomeDERP = prev.HomeDERP()
 		}
 		if len(n.Endpoints) == 0 {
-			n.Endpoints = prev.node.Endpoints().AsSlice()
+			n.Endpoints = prev.Endpoints().AsSlice()
 		}
 	}
 	return n.View()
@@ -336,44 +436,45 @@ func withGrantedCaps(n tailcfg.NodeView, granted []nodecap.Cap) tailcfg.NodeView
 	return ns.View()
 }
 
-// forgetExpiredTokenPeer forgets the token peer with the given ID if its
-// token expires at expiry. It reports whether it did (ok), and if so, whether
-// the peer is still present in nb.peers (and so must be removed by the
-// caller).
-func (nb *nodeBackend) forgetExpiredTokenPeer(id tailcfg.NodeID, expiry time.Time) (stillPresent, ok bool) {
+// forgetExpiredTokenPeer forgets the token of the local peer with the given
+// ID if it expires at expiry. It reports whether it did (ok), and if so, the
+// mutation (if any) for the caller to apply as a result: removing the peer,
+// or, if it has a lookup result too, updating it to be just that.
+func (nb *nodeBackend) forgetExpiredTokenPeer(id tailcfg.NodeID, expiry time.Time) (_ netmap.NodeMutation, ok bool) {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
-	tp := nb.tokenPeers[id]
-	if tp == nil || !tp.claims.Expiry.Equal(expiry) {
-		return false, false
+	lp := nb.localPeers[id]
+	if lp == nil || lp.claims == nil || !lp.claims.Expiry.Equal(expiry) {
+		return nil, false
 	}
-	delete(nb.tokenPeers, id)
-	_, present := nb.peers[id]
-	return present, true
+	lp.tokenTimer = nil // it fired; stopping it from its own func can deadlock
+	lp.clearToken()
+	return nb.localPeerChangedLocked(id, lp), true
 }
 
-// forgetTokenPeerLocked stops managing the token peer with the given ID, if
+// forgetLocalPeerLocked stops managing the local peer with the given ID, if
 // any. It doesn't remove the peer from nb.peers. nb.mu must be held.
-func (nb *nodeBackend) forgetTokenPeerLocked(id tailcfg.NodeID) {
-	if tp, ok := nb.tokenPeers[id]; ok {
-		tp.timer.Stop()
-		delete(nb.tokenPeers, id)
+func (nb *nodeBackend) forgetLocalPeerLocked(id tailcfg.NodeID) {
+	if lp, ok := nb.localPeers[id]; ok {
+		lp.clearToken()
+		lp.clearLookup()
+		delete(nb.localPeers, id)
 	}
 }
 
-// mergeTokenPeers implements [LocalBackend.mergeTokenPeersLocked]. If verify
-// is nil, all token peers are forgotten. Otherwise verify reports the peer
-// capabilities granted to each token peer under nm, and the peer's node is
-// updated to carry exactly those.
-func (nb *nodeBackend) mergeTokenPeers(nm *netmap.NetworkMap, verify func(token string) (*peertoken.Claims, []nodecap.Cap, error)) *netmap.NetworkMap {
+// mergeLocalPeers implements [LocalBackend.mergeLocalPeersLocked]. If verify
+// is nil, all local peers are forgotten. Otherwise verify reports the peer
+// capabilities granted to each local peer's token under nm, and the peer's
+// node is updated to carry exactly those.
+func (nb *nodeBackend) mergeLocalPeers(nm *netmap.NetworkMap, verify func(token string) (*peertoken.Claims, []nodecap.Cap, error)) *netmap.NetworkMap {
 	nb.mu.Lock()
 	defer nb.mu.Unlock()
-	if len(nb.tokenPeers) == 0 {
+	if len(nb.localPeers) == 0 {
 		return nm
 	}
 	if nm == nil || verify == nil {
-		for id := range nb.tokenPeers {
-			nb.forgetTokenPeerLocked(id)
+		for id := range nb.localPeers {
+			nb.forgetLocalPeerLocked(id)
 		}
 		return nm
 	}
@@ -395,11 +496,11 @@ func (nb *nodeBackend) mergeTokenPeers(nm *netmap.NetworkMap, verify func(token 
 		add  []tailcfg.NodeView
 		drop set.Set[tailcfg.NodeID] // our own copies already in nm.Peers
 	)
-	for id, tp := range nb.tokenPeers {
+	for id, lp := range nb.localPeers {
 		if p, ok := byID[id]; ok {
-			if !p.Equal(tp.node) {
+			if !p.Equal(lp.node) {
 				// Control now tells us about this node; it's authoritative.
-				nb.forgetTokenPeerLocked(id)
+				nb.forgetLocalPeerLocked(id)
 				continue
 			}
 			// nm already contains our copy (for instance, when the current
@@ -407,19 +508,25 @@ func (nb *nodeBackend) mergeTokenPeers(nm *netmap.NetworkMap, verify func(token 
 			drop.Make()
 			drop.Add(id)
 		}
-		_, granted, err := verify(tp.token)
-		if err != nil {
-			nb.logf("peertoken: dropping peer %d: %v", id, err)
-			nb.forgetTokenPeerLocked(id)
+		if lp.claims != nil {
+			if _, granted, err := verify(lp.token); err != nil {
+				nb.logf("peertoken: dropping token of peer %d: %v", id, err)
+				lp.clearToken()
+			} else {
+				lp.tokenNode = withGrantedCaps(lp.tokenNode, granted)
+			}
+		}
+		if lp.empty() {
+			nb.forgetLocalPeerLocked(id)
 			continue
 		}
-		if err := checkTokenPeerConflicts(tp.claims, nm.SelfNode, nodeByKey, nodeByAddr); err != nil {
+		lp.node = localPeerNode(lp.tokenNode, lp.lookupNode)
+		if err := checkLocalPeerConflicts(id, lp.node.Key(), lp.node.Addresses().AsSlice(), nm.SelfNode, nodeByKey, nodeByAddr); err != nil {
 			nb.logf("peertoken: dropping peer %d: %v", id, err)
-			nb.forgetTokenPeerLocked(id)
+			nb.forgetLocalPeerLocked(id)
 			continue
 		}
-		tp.node = withGrantedCaps(tp.node, granted)
-		add = append(add, tp.node)
+		add = append(add, lp.node)
 	}
 	if len(add) == 0 && len(drop) == 0 {
 		return nm

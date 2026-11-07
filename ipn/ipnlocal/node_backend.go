@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"time"
 	"sync"
 	"sync/atomic"
 
@@ -25,6 +26,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tailcfg/peercap"
+	"tailscale.com/tstime/rate"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -35,6 +37,7 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
+	"tailscale.com/util/singleflight"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine/filter"
@@ -176,11 +179,24 @@ type nodeBackend struct {
 	// detection relies on slice identity). It's nil when stale.
 	packetFilterWithTokenPeers []filter.Match
 
-	// tokenPeers are the peers we learned of via peer tokens rather than
-	// from control, keyed by node ID. Each is also present in peers (and
-	// the indexes derived from it) while its token is valid, unless
-	// control has since told us about the same node ID.
-	tokenPeers map[tailcfg.NodeID]*tokenPeer
+	// localPeers are the peers we learned of via peer tokens or peer
+	// lookups rather than from control's netmap, keyed by node ID. Each is
+	// also present in peers (and the indexes derived from it) while its
+	// token or lookup result is valid, unless control has since told us
+	// about the same node ID.
+	localPeers map[tailcfg.NodeID]*localPeer
+
+	// peerLookups deduplicates concurrent lookups of peers with control
+	// (see peerlookup.go).
+	peerLookups singleflight.Group[peerLookupQuery, tailcfg.NodeView]
+
+	// peerLookupFailures is when each recently failed peer lookup failed,
+	// so that we don't repeat it too often.
+	peerLookupFailures map[peerLookupQuery]time.Time
+
+	// peerLookupLimiter limits how often we look up peers; it's created
+	// lazily.
+	peerLookupLimiter *rate.Limiter
 
 	// keyWaitersForTest is the test-only registry of channels waiting for
 	// a given peer key to first appear in the netmap. See

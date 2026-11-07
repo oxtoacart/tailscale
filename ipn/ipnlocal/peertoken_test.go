@@ -46,6 +46,8 @@ type peerTokenTest struct {
 	clock   *tstest.Clock
 	signKey ed25519.PrivateKey
 	selfIP  netip.Addr
+
+	selfName string // if non-empty, the self node's MagicDNS name
 }
 
 func newPeerTokenTest(t *testing.T) *peerTokenTest {
@@ -86,6 +88,7 @@ func (pt *peerTokenTest) setNetMap(selfCaps tailcfg.NodeCapMap, peers []tailcfg.
 	self := &tailcfg.Node{
 		ID:        1,
 		StableID:  "self",
+		Name:      pt.selfName,
 		Key:       makeNodeKeyFromID(1),
 		Addresses: []netip.Prefix{netip.PrefixFrom(pt.selfIP, 32)},
 		CapMap:    selfCaps,
@@ -460,12 +463,12 @@ func TestPeerTokenFullNetmap(t *testing.T) {
 		p := newTokenPeerIdentity(100, "100.64.0.100")
 		pt.b.handlePeerToken(viaDERP(p, pt.token(p, time.Hour)))
 		pt.b.mu.Lock()
-		got := pt.b.mergeTokenPeersLocked(nil)
+		got := pt.b.mergeLocalPeersLocked(nil)
 		pt.b.mu.Unlock()
 		if got != nil {
 			t.Fatal("merge of nil netmap is non-nil")
 		}
-		if len(pt.b.currentNode().tokenPeers) != 0 {
+		if len(pt.b.currentNode().localPeers) != 0 {
 			t.Fatal("token peers not forgotten when netmap cleared")
 		}
 	})

@@ -1200,6 +1200,24 @@ func (c *Conn) LastRecvActivityOfNodeKey(nk key.NodePublic) string {
 	return mono.Since(saw).Round(time.Second).String()
 }
 
+// SinceLastSendToNodeKey returns how long ago WireGuard (or "tailscale
+// ping") last sent a packet to the peer with node key nk. It reports false
+// if nk isn't a peer, or nothing has been sent to it.
+func (c *Conn) SinceLastSendToNodeKey(nk key.NodePublic) (_ time.Duration, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	de, ok := c.peerMap.endpointForNodeKey(nk)
+	if !ok {
+		return 0, false
+	}
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	if de.lastSendExt.IsZero() {
+		return 0, false
+	}
+	return mono.Since(de.lastSendExt), true
+}
+
 // ProbeLocks acquires and releases Conn's internal mutex.
 func (c *Conn) ProbeLocks() {
 	c.mu.Lock()
