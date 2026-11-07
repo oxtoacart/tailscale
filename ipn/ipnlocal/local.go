@@ -434,6 +434,10 @@ type LocalBackend struct {
 	// [magicsock.Conn.SinceLastSendToNodeKey] for peer lookups.
 	sinceLastSendForTest func(key.NodePublic) (time.Duration, bool)
 
+	// contactNewTokenPeerForTest, if non-nil, replaces contacting new peers
+	// that present peer tokens (see [LocalBackend.contactNewTokenPeer]).
+	contactNewTokenPeerForTest func(key.NodePublic)
+
 	// Last ClientVersion received in MapResponse, guarded by mu.
 	lastClientVersion *tailcfg.ClientVersion
 

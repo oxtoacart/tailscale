@@ -49,6 +49,8 @@ var (
 	metricPeerTokenRenewed  = clientmetric.NewCounter("localbackend_peer_token_renewed")
 	metricPeerTokenRejected = clientmetric.NewCounter("localbackend_peer_token_rejected")
 	metricPeerTokenExpired  = clientmetric.NewCounter("localbackend_peer_token_expired")
+
+	metricPeerTokenContact = clientmetric.NewCounter("localbackend_peer_token_contact")
 )
 
 var errPeerTokenTailnetLock = errors.New("tailnet lock is enabled; peer tokens signed by control are not trusted")
@@ -152,23 +154,52 @@ func (nb *nodeBackend) localPeerChangedLocked(id tailcfg.NodeID, lp *localPeer) 
 
 // handlePeerToken is the [magicsock.Conn] peer token handler. It verifies the
 // token in m and, if valid, adds (or refreshes) the peer it describes.
+//
+// If the token's peer is one we didn't have, we then contact it right away;
+// see [LocalBackend.contactNewTokenPeer].
 func (b *LocalBackend) handlePeerToken(m magicsock.PeerTokenMessage) {
-	var notify *ipn.Notify
-	defer func() {
-		if notify != nil {
-			b.send(*notify)
-		}
-	}()
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	var err error
-	notify, err = b.acceptPeerTokenLocked(m)
+	notify, newPeer, err := b.acceptPeerToken(m)
 	if err != nil {
 		metricPeerTokenRejected.Add(1)
 		b.logf("peertoken: rejected token from disco %v: %v", m.DiscoKey.ShortString(), err)
 	}
+	if notify != nil {
+		b.send(*notify)
+	}
+	if !newPeer.IsZero() {
+		b.contactNewTokenPeer(newPeer)
+	}
+}
+
+// contactNewTokenPeer contacts the peer with node key nk, which we didn't
+// have until it presented its peer token, which it presumably did as it's
+// trying to reach us:
+//
+//   - It presents our own token, if we have one, to the peer, which may need
+//     it to accept our traffic (for instance, our replies, if the peer looked
+//     us up rather than accepting our token). Otherwise we'd only present it
+//     the next time we started disco pings to the peer.
+//   - It starts a WireGuard handshake with the peer. The peer's own
+//     initiation probably arrived before we accepted its token, when we
+//     didn't know its node key, and so was dropped. Otherwise the peer
+//     would wait for WireGuard to retry, 5s later.
+func (b *LocalBackend) contactNewTokenPeer(nk key.NodePublic) {
+	metricPeerTokenContact.Add(1)
+	if f := b.contactNewTokenPeerForTest; f != nil {
+		f(nk)
+		return
+	}
+	if ms := b.MagicConn(); ms != nil {
+		ms.PresentPeerToken(nk)
+	}
+	b.e.InitiateDevicePeerHandshake(nk)
+}
+
+// acceptPeerToken is acceptPeerTokenLocked, with b.mu held.
+func (b *LocalBackend) acceptPeerToken(m magicsock.PeerTokenMessage) (_ *ipn.Notify, newPeer key.NodePublic, _ error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.acceptPeerTokenLocked(m)
 }
 
 // verifyPeerToken verifies token against the signing keys in the self node's
@@ -189,55 +220,61 @@ func verifyPeerToken(self tailcfg.NodeView, token string, now time.Time) (*peert
 }
 
 // acceptPeerTokenLocked implements [LocalBackend.handlePeerToken]. It
-// returns a Notify for the caller to send after releasing b.mu, if any.
+// returns a Notify for the caller to send after releasing b.mu, if any, and
+// the token's node key if it added a peer that wasn't already present.
 //
 // b.mu must be held.
-func (b *LocalBackend) acceptPeerTokenLocked(m magicsock.PeerTokenMessage) (*ipn.Notify, error) {
+func (b *LocalBackend) acceptPeerTokenLocked(m magicsock.PeerTokenMessage) (_ *ipn.Notify, newPeer key.NodePublic, _ error) {
 	if b.shutdownCalled {
-		return nil, nil
+		return nil, key.NodePublic{}, nil
 	}
 	if b.tka != nil {
-		return nil, errPeerTokenTailnetLock
+		return nil, key.NodePublic{}, errPeerTokenTailnetLock
 	}
 	cn := b.currentNode()
 	nm := cn.NetMap()
 	if nm == nil || !nm.SelfNode.Valid() {
-		return nil, errors.New("no netmap")
+		return nil, key.NodePublic{}, errors.New("no netmap")
 	}
 	now := b.clock.Now()
 	c, granted, err := verifyPeerToken(nm.SelfNode, m.Token, now)
 	if err != nil {
-		return nil, err
+		return nil, key.NodePublic{}, err
 	}
 	// Bind the token to the transport: the disco message must have been
 	// sealed by the token's disco key, and if it came via DERP (which
 	// authenticates the sending node key), from the token's node key.
 	if c.DiscoKey != m.DiscoKey {
-		return nil, fmt.Errorf("token is for disco key %v, but message was sealed by %v", c.DiscoKey.ShortString(), m.DiscoKey.ShortString())
+		return nil, key.NodePublic{}, fmt.Errorf("token is for disco key %v, but message was sealed by %v", c.DiscoKey.ShortString(), m.DiscoKey.ShortString())
 	}
 	if !m.DERPNodeKey.IsZero() && m.DERPNodeKey != c.NodeKey {
-		return nil, fmt.Errorf("token is for node key %v, but message came via DERP from %v", c.NodeKey.ShortString(), m.DERPNodeKey.ShortString())
+		return nil, key.NodePublic{}, fmt.Errorf("token is for node key %v, but message came via DERP from %v", c.NodeKey.ShortString(), m.DERPNodeKey.ShortString())
 	}
 
+	_, hadPeer := cn.NodeByKey(c.NodeKey)
 	nodeID, expiry := c.NodeID, c.Expiry
 	n, renewed, err := cn.recordTokenPeer(c, granted, m, func() tstime.TimerController {
 		return b.clock.AfterFunc(expiry.Sub(now), func() { b.expireTokenPeer(cn, nodeID, expiry) })
 	})
 	if err != nil {
-		return nil, err
+		return nil, key.NodePublic{}, err
 	}
 	if renewed {
 		metricPeerTokenRenewed.Add(1)
 	}
 	if !n.Valid() {
-		return nil, nil
+		return nil, key.NodePublic{}, nil
 	}
 	if !renewed {
 		metricPeerTokenAccepted.Add(1)
 		b.logf("peertoken: accepted peer %v (node %d, %v, caps %q) until %v",
 			c.NodeKey.ShortString(), c.NodeID, c.Addresses, granted, c.Expiry.UTC().Format(time.RFC3339))
 	}
-	return b.applyNetmapDeltaLocked([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: n}}, false), nil
+	notify := b.applyNetmapDeltaLocked([]netmap.NodeMutation{netmap.NodeMutationUpsert{Node: n}}, false)
+	if !hadPeer {
+		newPeer = c.NodeKey
+	}
+	return notify, newPeer, nil
 }
 
 // expireTokenPeer removes the token peer with the given node ID from nb, if

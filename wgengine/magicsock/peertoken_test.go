@@ -271,3 +271,75 @@ func TestPeerTokenSentOnContact(t *testing.T) {
 		t.Fatal("peer token not received")
 	}
 }
+
+// TestPresentPeerToken checks that PresentPeerToken sends our peer token to
+// a peer without waiting for disco pings, and only once in a while.
+func TestPresentPeerToken(t *testing.T) {
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	m1 := newMagicStack(t, logger.WithPrefix(t.Logf, "conn1: "), localhostListener{}, derpMap)
+	defer m1.Close()
+	m2 := newMagicStack(t, logger.WithPrefix(t.Logf, "conn2: "), localhostListener{}, derpMap)
+	defer m2.Close()
+
+	got := make(chan PeerTokenMessage, 100)
+	m2.conn.SetPeerTokenHandler(func(m PeerTokenMessage) { got <- m })
+
+	const token = "a.b.c"
+	cleanupMesh := meshStacks(t.Logf, func(idx int, nm *netmap.NetworkMap) {
+		switch idx {
+		case 0:
+			self := nm.SelfNode.AsStruct()
+			self.CapMap = tailcfg.NodeCapMap{nodecap.PeerToken: {tailcfg.RawMessage(`{"token":"` + token + `"}`)}}
+			nm.SelfNode = self.View()
+		case 1:
+			nm.Peers = nil // m2 doesn't know m1
+		}
+	}, m1, m2)
+	defer cleanupMesh()
+
+	// Wait for m1 to know m2, with its disco key.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		m1.conn.mu.Lock()
+		de, ok := m1.conn.peerMap.endpointForNodeKey(m2.Public())
+		m1.conn.mu.Unlock()
+		if ok && de.disco.Load() != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("m1 doesn't know m2")
+		}
+	}
+
+	m1.conn.PresentPeerToken(m2.Public())
+	select {
+	case m := <-got:
+		if m.Token != token {
+			t.Errorf("token = %q; want %q", m.Token, token)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("peer token not received")
+	}
+	// One presentation may arrive both via DERP and directly.
+	drain := func() (n int) {
+		for {
+			select {
+			case <-got:
+				n++
+			case <-time.After(time.Second):
+				return n
+			}
+		}
+	}
+	drain()
+
+	// Presenting it again right away doesn't resend it.
+	m1.conn.PresentPeerToken(m2.Public())
+	if n := drain(); n != 0 {
+		t.Errorf("token resent %d times", n)
+	}
+
+	// Unknown peers are ignored.
+	m1.conn.PresentPeerToken(key.NewNode().Public())
+}

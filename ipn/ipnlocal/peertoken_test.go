@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +49,15 @@ type peerTokenTest struct {
 	selfIP  netip.Addr
 
 	selfName string // if non-empty, the self node's MagicDNS name
+
+	handshakesMu sync.Mutex
+	handshakes   []key.NodePublic // new token peers we contacted
+}
+
+func (pt *peerTokenTest) numHandshakes() int {
+	pt.handshakesMu.Lock()
+	defer pt.handshakesMu.Unlock()
+	return len(pt.handshakes)
 }
 
 func newPeerTokenTest(t *testing.T) *peerTokenTest {
@@ -64,6 +74,15 @@ func newPeerTokenTest(t *testing.T) *peerTokenTest {
 		clock:   clock,
 		signKey: priv,
 		selfIP:  netip.MustParseAddr("100.64.0.1"),
+	}
+	// Record contacts with new token peers, rather than creating them in
+	// the (real) WireGuard device: removing them on token expiry, from the
+	// fake clock's timer, would deadlock on the clock, as WireGuard reports
+	// the session's end.
+	b.contactNewTokenPeerForTest = func(k key.NodePublic) {
+		pt.handshakesMu.Lock()
+		defer pt.handshakesMu.Unlock()
+		pt.handshakes = append(pt.handshakes, k)
 	}
 	pt.setNetMap(pt.selfCapMap(), nil)
 	return pt
@@ -537,4 +556,39 @@ func TestPeerTokenMultipleCaps(t *testing.T) {
 		t.Fatalf("got %d peers; want 1", got)
 	}
 	checkCaps(testPeerCap2)
+}
+
+// TestPeerTokenContactsNewPeer checks that we contact a peer (presenting our
+// token, and starting a WireGuard handshake) when its token adds it, but not
+// when it renews the token of a peer we already have.
+func TestPeerTokenContactsNewPeer(t *testing.T) {
+	pt := newPeerTokenTest(t)
+	b := pt.b
+	p := newTokenPeerIdentity(100, "100.64.0.100")
+
+	b.handlePeerToken(viaDERP(p, pt.token(p, time.Hour)))
+	if len(pt.handshakes) != 1 || pt.handshakes[0] != p.node {
+		t.Errorf("handshakes after new peer = %v; want [%v]", pt.handshakes, p.node)
+	}
+
+	// Renewing the token doesn't.
+	b.handlePeerToken(viaDERP(p, pt.token(p, 2*time.Hour)))
+	if got := pt.numHandshakes(); got != 1 {
+		t.Errorf("handshakes after renewal = %d; want 1", got)
+	}
+
+	// Nor does a token from a peer we already had from a lookup.
+	lt := newPeerLookupTest(t)
+	p2 := newTokenPeerIdentity(101, "100.64.0.101")
+	lt.addControlPeer(p2, "peer.example.ts.net.")
+	if _, err := lt.b.lookupPeerWait(t.Context(), lt.b.currentNode(), peerLookupQuery{ip: p2.ip}); err != nil {
+		t.Fatal(err)
+	}
+	lt.b.handlePeerToken(viaDERP(p2, lt.token(p2, time.Hour)))
+	if got := lt.numHandshakes(); got != 0 {
+		t.Errorf("handshakes for looked-up peer = %d; want 0", got)
+	}
+	if got := lt.checkTCP22(p2); got != filter.Accept {
+		t.Errorf("filter port 22 = %v; want Accept", got)
+	}
 }

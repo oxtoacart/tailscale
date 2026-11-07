@@ -220,6 +220,17 @@ type Engine interface {
 	// caught up to a key learned via TSMP previously.
 	MarkDevicePeerForHandshake(key.NodePublic)
 
+	// InitiateDevicePeerHandshake starts a WireGuard handshake with the peer
+	// now, creating it in the device (from the config source) if needed,
+	// subject to WireGuard's usual rate limit on handshake initiations. It's
+	// a no-op if the config source doesn't know the peer.
+	//
+	// LocalBackend calls it when a peer it didn't have presents a peer token,
+	// as that peer is probably trying to handshake with us, and its first
+	// initiation probably arrived (and was dropped) before we accepted the
+	// token. Initiating ourselves saves it waiting for WireGuard's retry.
+	InitiateDevicePeerHandshake(key.NodePublic)
+
 	// SetNetLogSource installs the [NetLogSource] consulted by the
 	// engine's network flow logger for node lookups and the current
 	// audit logging identity.

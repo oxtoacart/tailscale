@@ -11,9 +11,9 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
-	"time"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go4.org/netipx"
 	"tailscale.com/feature/buildfeatures"

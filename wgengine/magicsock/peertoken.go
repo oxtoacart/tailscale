@@ -170,6 +170,30 @@ func (c *Conn) SendPeerToken(dst key.NodePublic, token []byte) error {
 	return c.sendPeerToken(dst, epDisco.key(), token, derpAddr, best)
 }
 
+// PresentPeerToken presents our own peer token, if we have one, to the peer
+// with node key dst now, rather than waiting until we next start disco
+// pings to it, unless we already presented it recently, as
+// [Conn.SendPeerToken] would before a disco ping. It's a no-op if dst isn't
+// a known peer.
+//
+// LocalBackend calls it for a peer it didn't have that presents its token,
+// which may need ours to accept traffic from us.
+func (c *Conn) PresentPeerToken(dst key.NodePublic) {
+	c.mu.Lock()
+	ep, ok := c.peerMap.endpointForNodeKey(dst)
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	epDisco := ep.disco.Load()
+	if epDisco == nil {
+		return
+	}
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+	ep.maybeSendPeerTokenLocked(mono.Now(), epDisco)
+}
+
 // sendPeerToken sends token to the peer with node key dst and disco key
 // dstDisco, via derpAddr and best, each if valid.
 //
