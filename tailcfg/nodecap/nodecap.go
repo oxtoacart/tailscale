@@ -388,6 +388,13 @@ const (
 	// If absent, the node doesn't send peer tokens.
 	PeerToken Cap = "tailscale.com/cap/peer-token"
 
+	// PeerLookup indicates that control serves "POST /machine/peer-lookup"
+	// (see [tailscale.com/tailcfg.PeerLookupRequest]) to this node, which it
+	// should use to find peers that aren't in its netmap when it wants to
+	// contact them, such as by Tailscale IP or MagicDNS name. It has no
+	// values.
+	PeerLookup Cap = "tailscale.com/cap/peer-lookup"
+
 	// CacheNetworkMaps instructs the node to persistently cache network
 	// maps and use them to establish peer connectivity on start, if doing so is
 	// supported by the client and storage is available. When this attribute is
