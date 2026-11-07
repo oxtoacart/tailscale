@@ -6309,6 +6309,10 @@ func (b *LocalBackend) authReconfigLocked() {
 		ExitNodeSelected: prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid(),
 		RouteAll:         flags&netmap.AllowSubnetRoutes != 0,
 		OneCGNAT:         oneCGNATRoute,
+		// If we may look up peers we don't have, the OS must send us
+		// packets for any Tailscale IP, not just those of peers we
+		// have, or we'd never see (and look up) the others.
+		AllTailscaleIPs: nm.SelfNode.Valid() && nm.SelfNode.CapMap().Contains(nodecap.PeerLookup),
 	})
 	for k := range changedAllowedIPs {
 		b.e.SyncDevicePeer(k)

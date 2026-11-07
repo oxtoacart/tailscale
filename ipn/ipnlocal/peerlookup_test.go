@@ -7,13 +7,17 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"tailscale.com/ipn"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
+	"tailscale.com/types/persist"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/wgengine/filter"
 )
@@ -478,5 +482,35 @@ func TestPeerLookupRateLimit(t *testing.T) {
 	defer nb.mu.Unlock()
 	if got := len(nb.peerLookupFailures); got > maxPeerLookupFailures {
 		t.Errorf("failures = %d; want <= %d", got, maxPeerLookupFailures)
+	}
+}
+
+// TestPeerLookupRoutesAllTailscaleIPs checks that a node that may look up
+// peers has the OS route all Tailscale IPs to it, not just those of peers it
+// has, as otherwise it would never see (and look up) packets for the others.
+func TestPeerLookupRoutesAllTailscaleIPs(t *testing.T) {
+	for _, lookup := range []bool{true, false} {
+		lt := newPeerLookupTest(t)
+		b := lt.b
+		if !lookup {
+			lt.setNetMap(lt.peerTokenTest.selfCapMap(), nil) // without nodecap.PeerLookup
+		}
+		b.mu.Lock()
+		err := b.pm.SetPrefs((&ipn.Prefs{
+			ControlURL:  "https://localhost:1/",
+			WantRunning: true,
+			Persist:     &persist.Persist{PrivateNodeKey: key.NewNode()},
+		}).View(), ipn.NetworkProfile{})
+		b.blocked = false
+		b.authReconfigLocked()
+		b.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		routes := b.currentNode().osRoutes()
+		has := slices.Contains(routes, tsaddr.CGNATRange()) && slices.Contains(routes, tsaddr.TailscaleULARange())
+		if has != lookup {
+			t.Errorf("lookup=%v: OS routes = %v; want Tailscale ranges = %v", lookup, routes, lookup)
+		}
 	}
 }

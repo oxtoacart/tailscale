@@ -976,6 +976,11 @@ type routePrefs struct {
 	// OneCGNAT is whether the OS route set should collapse peers'
 	// CGNAT addresses into the single /10 route.
 	OneCGNAT bool
+
+	// AllTailscaleIPs is whether the OS route set should always have the
+	// whole Tailscale IP ranges; see
+	// [routemanager.TailnetConfig.AllTailscaleIPs].
+	AllTailscaleIPs bool
 }
 
 // updateRouteManagerPrefs pushes p into the route manager.
@@ -1001,7 +1006,7 @@ func (nb *nodeBackend) updateRouteManagerPrefs(p routePrefs) routemanager.PeersW
 		ExitNodeSelected: p.ExitNodeSelected,
 		RouteAll:         p.RouteAll,
 	})
-	rt.SetTailnetConfig(routemanager.TailnetConfig{OneCGNAT: p.OneCGNAT})
+	rt.SetTailnetConfig(routemanager.TailnetConfig{OneCGNAT: p.OneCGNAT, AllTailscaleIPs: p.AllTailscaleIPs})
 	res := rt.Commit()
 	return res.AllowedIPs
 }
