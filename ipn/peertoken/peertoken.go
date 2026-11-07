@@ -47,6 +47,7 @@ import (
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
+	"tailscale.com/util/dnsname"
 )
 
 // CapPrefix is the prefix of each of [Claims.Caps] and of the corresponding
@@ -90,6 +91,10 @@ type Claims struct {
 	// within the Tailscale address ranges. At least one is required. The
 	// peer is allowed to originate traffic from exactly these addresses.
 	Addresses []netip.Prefix `json:"addresses"`
+
+	// Name, if non-empty, is the peer's MagicDNS name, fully qualified
+	// ("pi.foo.ts.net."), as in [tailcfg.Node.Name].
+	Name string `json:"name,omitempty"`
 
 	// Caps are the node capabilities the token may grant the peer, each of
 	// the form "cap:<peer-node-capability>". At least one is required.
@@ -316,6 +321,11 @@ func (c *Claims) validate(now time.Time) error {
 	for _, p := range c.Addresses {
 		if !p.IsValid() || !p.IsSingleIP() || !tsaddr.IsTailscaleIP(p.Addr()) {
 			return fmt.Errorf("invalid address %v: must be a single Tailscale IP", p)
+		}
+	}
+	if c.Name != "" {
+		if _, err := dnsname.ToFQDN(c.Name); err != nil {
+			return fmt.Errorf("invalid name %q: %w", c.Name, err)
 		}
 	}
 	if len(c.Caps) == 0 {

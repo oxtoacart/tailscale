@@ -592,3 +592,28 @@ func TestPeerTokenContactsNewPeer(t *testing.T) {
 		t.Errorf("filter port 22 = %v; want Accept", got)
 	}
 }
+
+// TestPeerTokenName checks that a token peer gets the name in its token,
+// but only if it's in our MagicDNS domain.
+func TestPeerTokenName(t *testing.T) {
+	for _, tt := range []struct {
+		name, want string
+	}{
+		{"peer.example.ts.net.", "peer.example.ts.net."},
+		{"", ""},
+		{"peer.other.ts.net.", ""},
+		{"a.peer.example.ts.net.", ""},
+		{"google.com.", ""},
+	} {
+		lt := newPeerLookupTest(t) // whose self node is self.example.ts.net.
+		p := newTokenPeerIdentity(100, "100.64.0.100")
+		lt.b.handlePeerToken(viaDERP(p, lt.token(p, time.Hour, func(c map[string]any) {
+			if tt.name != "" {
+				c["name"] = tt.name
+			}
+		})))
+		if got := lt.node(p).Name(); got != tt.want {
+			t.Errorf("token name %q: node name = %q; want %q", tt.name, got, tt.want)
+		}
+	}
+}

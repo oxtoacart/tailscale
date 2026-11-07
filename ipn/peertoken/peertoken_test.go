@@ -152,6 +152,7 @@ func TestVerifyRejects(t *testing.T) {
 			return s.sign(t, with("caps", []string{"cap:example.com/cap/widget", "example.com/cap/gadget"}))
 		}, "invalid cap"},
 		{"cap_empty", func() string { return s.sign(t, with("caps", []string{"cap:"})) }, "invalid cap"},
+		{"bad_name", func() string { return s.sign(t, with("name", "not a name!")) }, "invalid name"},
 		{"unknown_kid", func() string { return newTestSigner(t, "other").sign(t, validClaims()) }, "unknown signing key"},
 		{"wrong_key_same_kid", func() string { return newTestSigner(t, "k1").sign(t, validClaims()) }, "invalid signature"},
 		{"tampered_payload", func() string {

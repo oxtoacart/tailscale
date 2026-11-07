@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"tailscale.com/ipn"
@@ -389,7 +390,7 @@ func (nb *nodeBackend) recordTokenPeer(c *peertoken.Claims, granted []nodecap.Ca
 	prevTokenNode := lp.tokenNode
 	lp.clearToken()
 	lp.claims, lp.token = c, m.Token
-	lp.tokenNode = tokenPeerNode(c, granted, m, prevTokenNode)
+	lp.tokenNode = tokenPeerNode(c, granted, m, prevTokenNode, nb.netMap.MagicDNSSuffix())
 	lp.tokenTimer = newTimer()
 	if lp.lookupNode.Valid() && !sameKeys(lp.lookupNode, lp.tokenNode) {
 		// The peer's keys changed since we looked it up.
@@ -422,10 +423,15 @@ func checkLocalPeerConflicts(nodeID tailcfg.NodeID, nodeKey key.NodePublic, addr
 // received in m, with the peer capabilities granted. If prev is valid, it's
 // the node from the token being renewed, whose learned endpoints are carried
 // forward if m doesn't supply new ones.
-func tokenPeerNode(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerTokenMessage, prev tailcfg.NodeView) tailcfg.NodeView {
+//
+// The node gets the token's name only if it's a single label in
+// magicDNSSuffix, the self node's MagicDNS domain, so that a token can't
+// make MagicDNS answer for other names.
+func tokenPeerNode(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerTokenMessage, prev tailcfg.NodeView, magicDNSSuffix string) tailcfg.NodeView {
 	n := &tailcfg.Node{
 		ID:                c.NodeID,
 		StableID:          tailcfg.StableNodeID(cmp.Or(c.Subject, fmt.Sprintf("peertoken-%d", c.NodeID))),
+		Name:              tokenPeerName(c.Name, magicDNSSuffix),
 		Key:               c.NodeKey,
 		KeyExpiry:         c.Expiry,
 		DiscoKey:          c.DiscoKey,
@@ -448,6 +454,16 @@ func tokenPeerNode(c *peertoken.Claims, granted []nodecap.Cap, m magicsock.PeerT
 		}
 	}
 	return n.View()
+}
+
+// tokenPeerName returns name, a token's "name" claim, if it's a single label
+// in the MagicDNS domain suffix, and otherwise "".
+func tokenPeerName(name, suffix string) string {
+	base, ok := strings.CutSuffix(strings.ToLower(strings.TrimSuffix(name, ".")), "."+strings.ToLower(strings.TrimSuffix(suffix, ".")))
+	if !ok || suffix == "" || base == "" || strings.Contains(base, ".") {
+		return ""
+	}
+	return name
 }
 
 // tokenPeerCapMap returns the CapMap for a token peer granted the given peer
