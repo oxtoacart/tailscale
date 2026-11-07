@@ -2090,6 +2090,8 @@ func (e *mockEngine) syncedPeersSince(n int) []key.NodePublic {
 }
 
 func (e *mockEngine) MarkDevicePeerForHandshake(key.NodePublic) {}
+
+func (e *mockEngine) InitiateDevicePeerHandshake(key.NodePublic) {}
 func (e *mockEngine) SetPeerSessionStateFunc(func(key.NodePublic, wgengine.PeerWireGuardState)) {
 }
 func (e *mockEngine) SetNetLogSource(wgengine.NetLogSource) {}

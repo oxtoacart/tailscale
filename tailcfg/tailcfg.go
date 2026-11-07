@@ -3029,6 +3029,51 @@ type TokenResponse struct {
 	IDToken string `json:"id_token"`
 }
 
+// PeerLookupRequest asks control for the details a node needs to contact a
+// peer that isn't in its netmap, such as when control relies on peer tokens
+// (see package tailscale.com/ipn/peertoken) rather than sending peers.
+//
+// It is JSON-encoded and sent over Noise to "POST /machine/peer-lookup",
+// which control only serves to nodes with the [nodecap.PeerLookup]
+// capability.
+//
+// Exactly one of IP or Name must be set.
+//
+// [nodecap.PeerLookup]: https://pkg.go.dev/tailscale.com/tailcfg/nodecap#PeerLookup
+type PeerLookupRequest struct {
+	// Version is the client's current CapabilityVersion.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
+	// IP, if valid, is a Tailscale IP address of the peer to look up.
+	IP netip.Addr `json:",omitzero"`
+
+	// Name, if non-empty, is the MagicDNS name of the peer to look up: either
+	// a fully qualified name in the requester's tailnet ("pi.foo.ts.net",
+	// with or without a trailing dot) or a bare name ("pi").
+	Name string `json:",omitempty"`
+}
+
+// PeerLookupResponse is the response to a [PeerLookupRequest].
+//
+// If there's no such peer, control responds with HTTP status 404 instead.
+type PeerLookupResponse struct {
+	// Node is the peer. Only the fields needed to contact it are set: ID,
+	// StableID, Name, Key, KeyExpiry, DiscoKey, Addresses, AllowedIPs,
+	// HomeDERP, Endpoints and Cap.
+	//
+	// Being returned doesn't mean the requester may access the peer; the
+	// peer decides that from the requester's peer token.
+	Node *Node
+
+	// TTLSeconds is how long the requester may use Node before it must look
+	// the peer up again, as the peer's endpoints and home DERP region may
+	// change.
+	TTLSeconds int
+}
+
 // PeerChange is an update to a node.
 type PeerChange struct {
 	// NodeID is the node ID being mutated. If the NodeID is not

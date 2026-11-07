@@ -724,6 +724,17 @@ func (e *userspaceEngine) MarkDevicePeerForHandshake(k key.NodePublic) {
 	e.wgdev.ScheduleHandshakeOnUserSend(k.Raw32())
 }
 
+// InitiateDevicePeerHandshake implements [Engine.InitiateDevicePeerHandshake].
+func (e *userspaceEngine) InitiateDevicePeerHandshake(k key.NodePublic) {
+	p := e.wgdev.LookupPeer(k.Raw32())
+	if p == nil {
+		return
+	}
+	if err := p.SendHandshakeInitiation(false); err != nil {
+		e.logf("wgengine: initiating handshake with %v: %v", k.ShortString(), err)
+	}
+}
+
 // SetPeerByIPPacketFunc installs a callback used by wireguard-go to look up
 // which peer should handle an outbound packet by destination IP.
 //

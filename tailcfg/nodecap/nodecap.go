@@ -370,6 +370,31 @@ const (
 	// TODO(bradfitz): remove this a few releases after 2026-02-16.
 	ForceRegisterMagicDNSIPv4Only Cap = "force-register-magicdns-ipv4-only"
 
+	// PeerTokenKeys lists the public keys with which control signs peer
+	// tokens (see package tailscale.com/ipn/peertoken). Each value is a JSON
+	// Web Key (RFC 7517) for an Ed25519 public key, of the form
+	// {"kty":"OKP","crv":"Ed25519","x":"<base64url>","kid":"<key ID>"}.
+	//
+	// If absent, the node rejects all peer tokens.
+	PeerTokenKeys Cap = "tailscale.com/cap/peer-token-keys"
+
+	// PeerToken carries this node's own peer token (see package
+	// tailscale.com/ipn/peertoken), which it presents in a disco PeerToken
+	// message to peers it contacts, so that peers which control didn't put
+	// this node in the netmap of can still accept connections from it. The
+	// value is a JSON object of the form {"token":"<compact JWT>"}. If there
+	// are multiple values, the first with a non-empty token is used.
+	//
+	// If absent, the node doesn't send peer tokens.
+	PeerToken Cap = "tailscale.com/cap/peer-token"
+
+	// PeerLookup indicates that control serves "POST /machine/peer-lookup"
+	// (see [tailscale.com/tailcfg.PeerLookupRequest]) to this node, which it
+	// should use to find peers that aren't in its netmap when it wants to
+	// contact them, such as by Tailscale IP or MagicDNS name. It has no
+	// values.
+	PeerLookup Cap = "tailscale.com/cap/peer-lookup"
+
 	// CacheNetworkMaps instructs the node to persistently cache network
 	// maps and use them to establish peer connectivity on start, if doing so is
 	// supported by the client and storage is available. When this attribute is

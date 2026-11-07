@@ -38,6 +38,9 @@ func (b *LocalBackend) lookupPeerByIP(ip netip.Addr) (key.NodePublic, bool) {
 	if pr, ok := nb.routeMgr.Outbound().Lookup(ip); ok {
 		return pr.Key, true
 	}
+	// Control may not have told us about the peer; ask it, for later
+	// packets.
+	b.maybeLookupPeerByIPAsync(nb, ip)
 	return key.NodePublic{}, false
 }
 
@@ -90,7 +93,12 @@ func (m magicDNSHosts) LookupHost(fqdn dnsname.FQDN) (ips []netip.Addr, ok bool)
 	if !buildfeatures.HasDNS {
 		return nil, false
 	}
-	return m.b.currentNode().magicDNSHostAddrs(fqdn)
+	if ips, ok := m.b.currentNode().magicDNSHostAddrs(fqdn); ok {
+		return ips, true
+	}
+	// Control may not have told us about the peer; ask it. This blocks
+	// the query briefly, but only for names in our tailnet's domain.
+	return m.b.lookupPeerForDNS(fqdn)
 }
 
 func (m magicDNSHosts) LookupPTR(ip netip.Addr) (_ dnsname.FQDN, ok bool) {

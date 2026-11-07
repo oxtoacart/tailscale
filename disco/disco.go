@@ -51,6 +51,7 @@ const (
 	TypeCallMeMaybeVia                   = MessageType(0x07)
 	TypeAllocateUDPRelayEndpointRequest  = MessageType(0x08)
 	TypeAllocateUDPRelayEndpointResponse = MessageType(0x09)
+	TypePeerToken                        = MessageType(0x0a)
 )
 
 const v0 = byte(0)
@@ -103,6 +104,8 @@ func Parse(p []byte) (Message, error) {
 		return parseAllocateUDPRelayEndpointRequest(ver, p)
 	case TypeAllocateUDPRelayEndpointResponse:
 		return parseAllocateUDPRelayEndpointResponse(ver, p)
+	case TypePeerToken:
+		return parsePeerToken(ver, p)
 	default:
 		return nil, fmt.Errorf("unknown message type 0x%02x", byte(t))
 	}
@@ -304,6 +307,8 @@ func MessageSummary(m Message) string {
 		return "allocate-udp-relay-endpoint-request"
 	case *AllocateUDPRelayEndpointResponse:
 		return "allocate-udp-relay-endpoint-response"
+	case *PeerToken:
+		return fmt.Sprintf("peer-token len=%d", len(m.Token))
 	default:
 		return fmt.Sprintf("%#v", m)
 	}
@@ -655,4 +660,45 @@ func parseCallMeMaybeVia(ver uint8, p []byte) (m *CallMeMaybeVia, err error) {
 	}
 	err = m.decode(p)
 	return m, err
+}
+
+// MaxPeerTokenLen is the maximum length of [PeerToken.Token] that will be
+// marshaled or accepted when parsing.
+const MaxPeerTokenLen = 4096
+
+// PeerToken is a message carrying a control-signed credential (a compact
+// serialized JWT) that authorizes the sender to communicate with the
+// recipient, even if the recipient's netmap does not list the sender as a
+// peer. See package tailscale.com/ipn/peertoken for the token format.
+//
+// Unlike other disco messages, recipients accept PeerToken messages from
+// senders whose disco key is not (yet) known to them. The token binds the
+// sender's disco key, which the recipient checks against the disco key that
+// sealed the message. A peer may send a fresh PeerToken at any time to extend
+// its authorization.
+//
+// It may be sent over DERP or directly over UDP.
+type PeerToken struct {
+	// Token is the compact serialized JWT. It must be non-empty and at most
+	// [MaxPeerTokenLen] bytes.
+	Token []byte
+}
+
+func (m *PeerToken) AppendMarshal(b []byte) []byte {
+	ret, d := appendMsgHeader(b, TypePeerToken, v0, len(m.Token))
+	copy(d, m.Token)
+	return ret
+}
+
+func parsePeerToken(ver uint8, p []byte) (m *PeerToken, err error) {
+	if ver != v0 {
+		return nil, fmt.Errorf("unknown PeerToken version %d", ver)
+	}
+	if len(p) == 0 {
+		return nil, errShort
+	}
+	if len(p) > MaxPeerTokenLen {
+		return nil, fmt.Errorf("PeerToken too long (%d bytes)", len(p))
+	}
+	return &PeerToken{Token: append([]byte(nil), p...)}, nil
 }
