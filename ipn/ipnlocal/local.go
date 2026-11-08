@@ -2532,6 +2532,7 @@ var (
 	_ controlclient.NetmapDeltaUpdater  = (*LocalBackend)(nil)
 	_ controlclient.PacketFilterUpdater = (*LocalBackend)(nil)
 	_ controlclient.UserProfileUpdater  = (*LocalBackend)(nil)
+	_ controlclient.PeerTokenUpdater    = (*LocalBackend)(nil)
 )
 
 // UpdateNetmapDelta implements controlclient.NetmapDeltaUpdater.
@@ -7550,8 +7551,10 @@ func (b *LocalBackend) setNetMapLocked(nm *netmap.NetworkMap) {
 			} else {
 				ms.SetNetworkMap(nm.SelfNode, nm.Peers)
 			}
+			ms.SetSelfPeerToken(nm.PeerToken)
 		} else {
 			ms.SetNetworkMap(tailcfg.NodeView{}, nil)
+			ms.SetSelfPeerToken("")
 		}
 	}
 	// Reset the WireGuard session for peers whose disco key changed in

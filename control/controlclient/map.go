@@ -87,6 +87,7 @@ type mapSession struct {
 	lastDERPMap            *tailcfg.DERPMap
 	lastUserProfile        map[tailcfg.UserID]tailcfg.UserProfileView
 	lastPacketFilterRules  views.Slice[tailcfg.FilterRule] // concatenation of all namedPacketFilters
+	lastPeerToken          string                          // latest MapResponse.PeerToken
 	namedPacketFilters     map[string]views.Slice[tailcfg.FilterRule]
 	lastParsedPacketFilter []filter.Match
 	lastSSHPolicy          *tailcfg.SSHPolicy
@@ -348,6 +349,17 @@ func (ms *mapSession) tryHandleIncrementally(res *tailcfg.MapResponse) bool {
 	if !mutationsOK {
 		return false
 	}
+	// Deliver a new peer token (typically sent alone, as it's renewed every
+	// few minutes) without a full netmap rebuild.
+	if res.PeerToken != "" {
+		ptu, ok := ms.netmapUpdater.(PeerTokenUpdater)
+		if !ok {
+			return false
+		}
+		if !ptu.UpdatePeerToken(res.PeerToken) {
+			return false
+		}
+	}
 	if len(mutations) > 0 {
 		return nud.UpdateNetmapDelta(mutations)
 	}
@@ -367,6 +379,10 @@ type updateStats struct {
 // updateStateFromResponse updates ms from res. It takes ownership of res.
 func (ms *mapSession) updateStateFromResponse(resp *tailcfg.MapResponse) {
 	ms.updatePeersStateFromResponse(resp)
+
+	if resp.PeerToken != "" {
+		ms.lastPeerToken = resp.PeerToken
+	}
 
 	if resp.Node != nil {
 		ms.lastNode = resp.Node.View()
@@ -1025,6 +1041,7 @@ func (ms *mapSession) netmap() *netmap.NetworkMap {
 	nm := &netmap.NetworkMap{
 		NodeKey:           ms.publicNodeKey,
 		MachineKey:        ms.machinePubKey,
+		PeerToken:         ms.lastPeerToken,
 		Peers:             peerViews,
 		UserProfiles:      make(map[tailcfg.UserID]tailcfg.UserProfileView),
 		Domain:            ms.lastDomain,

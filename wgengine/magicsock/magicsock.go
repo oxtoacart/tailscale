@@ -281,8 +281,8 @@ type Conn struct {
 	// including from senders not in the netmap. See [Conn.SetPeerTokenHandler].
 	peerTokenHandler syncs.AtomicValue[func(PeerTokenMessage)]
 
-	// selfPeerToken is this node's own peer token from the self node's
-	// CapMap, or nil if it has none. A new pointer is stored only when the
+	// selfPeerToken is this node's own peer token (see
+	// [Conn.SetSelfPeerToken]), or nil if it has none. A new pointer is stored only when the
 	// token changes, so endpoints compare pointers to tell whether they've
 	// sent the current token. See [endpoint.maybeSendPeerTokenLocked].
 	selfPeerToken atomic.Pointer[selfPeerToken]
@@ -3196,7 +3196,6 @@ func (c *Conn) updateNodes(self tailcfg.NodeView, peers []tailcfg.NodeView) (pee
 	metricNumPeers.Set(int64(len(peers)))
 	selfWasValid := c.self.Valid()
 	c.self = self
-	c.updateSelfPeerTokenLocked(self)
 
 	// [debugFlags] are mutable in [Conn.SetSilentDisco] &
 	// [Conn.SetProbeUDPLifetime]. These setters are passed [controlknobs.Knobs]

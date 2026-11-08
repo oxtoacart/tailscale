@@ -4,7 +4,6 @@
 package magicsock
 
 import (
-	"bytes"
 	"errors"
 	"net/netip"
 	"time"
@@ -12,7 +11,6 @@ import (
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/tstime/rate"
 	"tailscale.com/types/key"
@@ -61,6 +59,7 @@ var (
 	metricRecvDiscoPeerTokenUnknownPeer = clientmetric.NewCounter("magicsock_disco_recv_peer_token_unknown_peer")
 	metricRecvDiscoPeerTokenRateLimited = clientmetric.NewCounter("magicsock_disco_recv_peer_token_rate_limited")
 	metricSentDiscoPeerToken            = clientmetric.NewCounter("magicsock_disco_sent_peer_token")
+	metricSentDiscoPeerTokenRenewed     = clientmetric.NewCounter("magicsock_disco_sent_peer_token_renewed")
 )
 
 // SetPeerTokenHandler sets the function that is called (in its own
@@ -147,8 +146,7 @@ func (c *Conn) dispatchPeerTokenLocked(fn func(PeerTokenMessage), pt *disco.Peer
 // known, the peer's best direct path. The peer must be known to c.
 //
 // Callers don't normally need this: c automatically presents the self
-// node's own token (from its [nodecap.PeerToken] capability) to the peers it
-// contacts.
+// node's own token (see [Conn.SetSelfPeerToken]) to the peers it contacts.
 func (c *Conn) SendPeerToken(dst key.NodePublic, token []byte) error {
 	if len(token) == 0 || len(token) > disco.MaxPeerTokenLen {
 		return errors.New("invalid peer token length")
@@ -226,52 +224,65 @@ func (c *Conn) sendPeerToken(dst key.NodePublic, dstDisco key.DiscoPublic, token
 	return errors.New("no path to peer")
 }
 
-// selfPeerToken is this node's own peer token, as given by control in the
-// self node's CapMap under [nodecap.PeerToken].
+// selfPeerToken is this node's own peer token, as given by control in
+// [tailcfg.MapResponse.PeerToken].
 type selfPeerToken struct {
 	token []byte // compact serialized JWT; non-empty
 }
 
-// peerTokenCapValue is the JSON form of a [nodecap.PeerToken] value.
-type peerTokenCapValue struct {
-	Token string `json:"token"`
-}
-
-// peerTokenFromSelf returns the self node's own peer token, from the first
-// [nodecap.PeerToken] value in its CapMap with a usable token, or nil if
-// there's none.
-func peerTokenFromSelf(self tailcfg.NodeView) ([]byte, error) {
-	if !self.Valid() {
-		return nil, nil
+// SetSelfPeerToken sets this node's own peer token, which c presents to
+// the peers it contacts (see [endpoint.maybeSendPeerTokenLocked]). An empty
+// token means none, as does one too long to send.
+//
+// It stores a new token only if it changed, so that peers already
+// presented the current one aren't presented it again.
+//
+// When the token changes (as control renews it every few minutes), it's
+// presented right away to the peers that we've exchanged traffic with since
+// we last presented them one, which are presumably still using it, so that
+// they don't drop us when the old one expires: we might not otherwise send
+// them disco pings (and present the new token) before then, say if we're
+// only receiving from them. Peers we've stopped talking to let our old token
+// lapse, and get the new one if we contact them again.
+func (c *Conn) SetSelfPeerToken(token string) {
+	if len(token) > disco.MaxPeerTokenLen {
+		c.logf("magicsock: peer token too long (%d bytes); not presenting it", len(token))
+		token = ""
 	}
-	vals, err := tailcfg.UnmarshalNodeCapViewJSON[peerTokenCapValue](self.CapMap(), nodecap.PeerToken)
-	for _, v := range vals {
-		if n := len(v.Token); n > 0 && n <= disco.MaxPeerTokenLen {
-			return []byte(v.Token), nil
-		}
-	}
-	if err == nil && len(vals) > 0 {
-		err = errors.New("no value has a token of valid length")
-	}
-	return nil, err
-}
-
-// updateSelfPeerTokenLocked updates c.selfPeerToken from self, the new self
-// node. It stores a new pointer only if the token changed. c.mu must be held.
-func (c *Conn) updateSelfPeerTokenLocked(self tailcfg.NodeView) {
-	token, err := peerTokenFromSelf(self)
-	if err != nil {
-		c.logf("magicsock: invalid %s capability: %v", nodecap.PeerToken, err)
-	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	old := c.selfPeerToken.Load()
 	switch {
-	case token == nil:
+	case token == "":
 		if old != nil {
 			c.selfPeerToken.Store(nil)
 		}
-	case old == nil || !bytes.Equal(old.token, token):
-		c.selfPeerToken.Store(&selfPeerToken{token: token})
+	case old == nil || string(old.token) != token:
+		c.selfPeerToken.Store(&selfPeerToken{token: []byte(token)})
+		if old != nil {
+			c.presentRenewedPeerTokenLocked()
+		}
 	}
+}
+
+// presentRenewedPeerTokenLocked presents our new peer token to the peers
+// we've exchanged traffic with since we last presented them one. See
+// [Conn.SetSelfPeerToken]. c.mu must be held.
+func (c *Conn) presentRenewedPeerTokenLocked() {
+	now := mono.Now()
+	c.peerMap.forEachEndpoint(func(de *endpoint) {
+		de.mu.Lock()
+		defer de.mu.Unlock()
+		if de.peerTokenSent == nil {
+			return // never presented one, so the peer doesn't need ours
+		}
+		lastActive := max(de.lastSendExt, de.lastRecvWG.LoadAtomic())
+		if !lastActive.After(de.peerTokenSentAt) {
+			return // idle since we last presented a token
+		}
+		metricSentDiscoPeerTokenRenewed.Add(1)
+		de.maybeSendPeerTokenLocked(now, de.disco.Load())
+	})
 }
 
 // peerTokenResendInterval is how long we go without hearing from a peer

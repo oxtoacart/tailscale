@@ -376,6 +376,7 @@ func TestUpdatePeers(t *testing.T) {
 // network map caching, and thus skipped when comparing test results.
 var skippedMapFields = []string{
 	"Cached",
+	"PeerToken", // short-lived, so not cached
 }
 
 // checkFieldCoverage logs an error in t if any of the fields of nm are zero

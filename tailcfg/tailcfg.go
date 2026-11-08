@@ -199,7 +199,8 @@ type CapabilityVersion int
 //   - 148: 2026-09-15: Client understands [Node.StableTailnetID]
 //   - 149: 2026-10-07: Sentinel version to request the server send back [NodeAttrCacheNetworkMaps] set to enabled
 //   - 150: 2026-10-13: Client handles app connectors with "mode": "magicip" as conn25.
-const CurrentCapabilityVersion CapabilityVersion = 150
+//   - 151: 2026-11-08: Client handles [MapResponse.PeerToken]
+const CurrentCapabilityVersion CapabilityVersion = 151
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -2205,6 +2206,18 @@ type MapResponse struct {
 	// download and whether the client is using it. A nil value means no change
 	// or nothing to report.
 	ClientVersion *ClientVersion `json:",omitempty"`
+
+	// PeerToken, if non-empty, is this node's new peer token (see package
+	// tailscale.com/ipn/peertoken): a compact serialized JWT, signed by
+	// control, that the node presents in a disco PeerToken message to peers
+	// it contacts, so that peers which control didn't put this node in the
+	// netmap of can still accept connections from it. An empty value means
+	// no change. Control sends a new one before the current one expires.
+	//
+	// It's a MapResponse field rather than a self node capability so that
+	// control can renew a token without sending (or the client rebuilding
+	// its netmap for) the whole self node.
+	PeerToken string `json:",omitempty"`
 
 	// DeprecatedDefaultAutoUpdate is the default node auto-update setting for this
 	// tailnet. The node is free to opt-in or out locally regardless of this

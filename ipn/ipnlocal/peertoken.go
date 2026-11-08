@@ -52,6 +52,8 @@ var (
 	metricPeerTokenExpired  = clientmetric.NewCounter("localbackend_peer_token_expired")
 
 	metricPeerTokenContact = clientmetric.NewCounter("localbackend_peer_token_contact")
+	metricPeerTokenUpdated = clientmetric.NewCounter("localbackend_peer_token_updated")
+	metricPeerTokenRevoked = clientmetric.NewCounter("localbackend_peer_token_revoked")
 )
 
 var errPeerTokenTailnetLock = errors.New("tailnet lock is enabled; peer tokens signed by control are not trusted")
@@ -207,6 +209,10 @@ func (b *LocalBackend) acceptPeerToken(m magicsock.PeerTokenMessage) (_ *ipn.Not
 // CapMap, and returns its claims and the peer capabilities that self grants
 // it: those of the token's caps that have a "cap:..." entry in self's CapMap.
 // It reports an error if self grants none of them.
+//
+// If the token is valid but self grants none of its caps, it returns the
+// claims along with an error wrapping errPeerTokenNoCaps, as such a token
+// still revokes older tokens of the same peer.
 func verifyPeerToken(self tailcfg.NodeView, token string, now time.Time) (*peertoken.Claims, []nodecap.Cap, error) {
 	ks, _ := peertoken.KeySetFromSelfCapMap(self.CapMap())
 	c, err := peertoken.Verify(token, ks, now)
@@ -215,10 +221,14 @@ func verifyPeerToken(self tailcfg.NodeView, token string, now time.Time) (*peert
 	}
 	granted := c.GrantedPeerCaps(self.CapMap())
 	if len(granted) == 0 {
-		return nil, nil, fmt.Errorf("control granted this node none of the token's caps %q", c.Caps)
+		return c, nil, fmt.Errorf("%w %q", errPeerTokenNoCaps, c.Caps)
 	}
 	return c, granted, nil
 }
+
+// errPeerTokenNoCaps is returned (wrapped) by verifyPeerToken for valid
+// tokens that the self node grants none of the caps of.
+var errPeerTokenNoCaps = errors.New("control granted this node none of the token's caps")
 
 // acceptPeerTokenLocked implements [LocalBackend.handlePeerToken]. It
 // returns a Notify for the caller to send after releasing b.mu, if any, and
@@ -239,7 +249,7 @@ func (b *LocalBackend) acceptPeerTokenLocked(m magicsock.PeerTokenMessage) (_ *i
 	}
 	now := b.clock.Now()
 	c, granted, err := verifyPeerToken(nm.SelfNode, m.Token, now)
-	if err != nil {
+	if c == nil {
 		return nil, key.NodePublic{}, err
 	}
 	// Bind the token to the transport: the disco message must have been
@@ -250,6 +260,22 @@ func (b *LocalBackend) acceptPeerTokenLocked(m magicsock.PeerTokenMessage) (_ *i
 	}
 	if !m.DERPNodeKey.IsZero() && m.DERPNodeKey != c.NodeKey {
 		return nil, key.NodePublic{}, fmt.Errorf("token is for node key %v, but message came via DERP from %v", c.NodeKey.ShortString(), m.DERPNodeKey.ShortString())
+	}
+	if err != nil {
+		// A valid token granting us nothing: the peer has lost the access
+		// its older token gave it (say, it was removed from a group), so
+		// stop honoring that one now, rather than when it expires.
+		if mut, ok := cn.revokeTokenPeer(c); ok {
+			metricPeerTokenRevoked.Add(1)
+			b.logf("peertoken: peer %v (node %d) presented a newer token granting none of our caps; revoked its older token",
+				c.NodeKey.ShortString(), c.NodeID)
+			var notify *ipn.Notify
+			if mut != nil {
+				notify = b.applyNetmapDeltaLocked([]netmap.NodeMutation{mut}, false)
+			}
+			return notify, key.NodePublic{}, err
+		}
+		return nil, key.NodePublic{}, err
 	}
 
 	_, hadPeer := cn.NodeByKey(c.NodeKey)
@@ -505,6 +531,22 @@ func (nb *nodeBackend) forgetExpiredTokenPeer(id tailcfg.NodeID, expiry time.Tim
 	return nb.localPeerChangedLocked(id, lp), true
 }
 
+// revokeTokenPeer forgets the token of the local peer described by c, a
+// valid token that grants nothing, if c is for the same node (ID and node
+// key) as that token and newer. It reports whether it did, and if so, the
+// mutation (if any) for the caller to apply as a result: removing the peer,
+// or, if it has a lookup result too, updating it to be just that.
+func (nb *nodeBackend) revokeTokenPeer(c *peertoken.Claims) (_ netmap.NodeMutation, ok bool) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	lp := nb.localPeers[c.NodeID]
+	if lp == nil || lp.claims == nil || lp.claims.NodeKey != c.NodeKey || !c.Expiry.After(lp.claims.Expiry) {
+		return nil, false
+	}
+	lp.clearToken()
+	return nb.localPeerChangedLocked(c.NodeID, lp), true
+}
+
 // forgetLocalPeerLocked stops managing the local peer with the given ID, if
 // any. It doesn't remove the peer from nb.peers. nb.mu must be held.
 func (nb *nodeBackend) forgetLocalPeerLocked(id tailcfg.NodeID) {
@@ -635,4 +677,42 @@ func (nb *nodeBackend) packetFilterWithTokenPeerRules() []filter.Match {
 		nb.packetFilterWithTokenPeers = slices.Concat(nb.packetFilter, nb.tokenPeerFilter)
 	}
 	return nb.packetFilterWithTokenPeers
+}
+
+// UpdatePeerToken implements [controlclient.PeerTokenUpdater]: it installs
+// token, this node's new peer token from control, without a full netmap
+// rebuild.
+//
+// The current netmap is replaced by a copy carrying the token, so that the
+// token isn't lost (or an older one restored) if the netmap is later
+// reinstalled.
+func (b *LocalBackend) UpdatePeerToken(token string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cn := b.currentNode()
+	if !cn.setPeerToken(token) {
+		// No netmap installed yet; the initial full-netmap path will
+		// take care of installing the token.
+		return false
+	}
+	metricPeerTokenUpdated.Add(1)
+	if ms, ok := b.sys.MagicSock.GetOK(); ok {
+		ms.SetSelfPeerToken(token)
+	}
+	return true
+}
+
+// setPeerToken replaces nb's netmap with a copy whose PeerToken is token.
+// It reports false if nb has no netmap.
+func (nb *nodeBackend) setPeerToken(token string) bool {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	if nb.netMap == nil {
+		return false
+	}
+	nm := new(netmap.NetworkMap)
+	*nm = *nb.netMap
+	nm.PeerToken = token
+	nb.netMap = nm
+	return true
 }

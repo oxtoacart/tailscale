@@ -519,6 +519,7 @@ func (mrs mapRoutineState) UpdateNetmapDelta(muts []netmap.NodeMutation) bool {
 var (
 	_ PacketFilterUpdater = mapRoutineState{}
 	_ UserProfileUpdater  = mapRoutineState{}
+	_ PeerTokenUpdater    = mapRoutineState{}
 )
 
 // UpdatePacketFilter implements [PacketFilterUpdater] by forwarding to
@@ -541,6 +542,35 @@ func (mrs mapRoutineState) UpdatePacketFilter(rules views.Slice[tailcfg.FilterRu
 	ch := make(chan bool, 1)
 	c.observerQueue.Add(func() {
 		ch <- pfu.UpdatePacketFilter(rules, parsed)
+	})
+	select {
+	case applied := <-ch:
+		return applied
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// UpdatePeerToken implements [PeerTokenUpdater] by forwarding to
+// [Auto.observer] if it implements [PeerTokenUpdater]. It returns false
+// (signaling fall back to a full netmap rebuild) if the downstream observer
+// doesn't implement [PeerTokenUpdater] or isn't in a state to accept
+// updates.
+func (mrs mapRoutineState) UpdatePeerToken(token string) bool {
+	c := mrs.c
+	c.mu.Lock()
+	goodState := c.loggedIn && c.inMapPoll
+	ptu, ok := c.observer.(PeerTokenUpdater)
+	mapCtx := c.mapCtx
+	c.mu.Unlock()
+	if !goodState || !ok {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(mapCtx, 2*time.Second)
+	defer cancel()
+	ch := make(chan bool, 1)
+	c.observerQueue.Add(func() {
+		ch <- ptu.UpdatePeerToken(token)
 	})
 	select {
 	case applied := <-ch:

@@ -378,16 +378,6 @@ const (
 	// If absent, the node rejects all peer tokens.
 	PeerTokenKeys Cap = "tailscale.com/cap/peer-token-keys"
 
-	// PeerToken carries this node's own peer token (see package
-	// tailscale.com/ipn/peertoken), which it presents in a disco PeerToken
-	// message to peers it contacts, so that peers which control didn't put
-	// this node in the netmap of can still accept connections from it. The
-	// value is a JSON object of the form {"token":"<compact JWT>"}. If there
-	// are multiple values, the first with a non-empty token is used.
-	//
-	// If absent, the node doesn't send peer tokens.
-	PeerToken Cap = "tailscale.com/cap/peer-token"
-
 	// PeerLookup indicates that control serves "POST /machine/peer-lookup"
 	// (see [tailscale.com/tailcfg.PeerLookupRequest]) to this node, which it
 	// should use to find peers that aren't in its netmap when it wants to

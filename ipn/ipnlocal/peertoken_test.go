@@ -617,3 +617,95 @@ func TestPeerTokenName(t *testing.T) {
 		}
 	}
 }
+
+// TestPeerTokenRevokedByNewerToken checks that a newer token from a peer
+// that grants none of our caps (as when the peer has lost access, say by
+// leaving a group) revokes its older token, but an older or no newer one
+// doesn't.
+func TestPeerTokenRevokedByNewerToken(t *testing.T) {
+	noCaps := withCaps("cap:example.com/cap/other")
+
+	t.Run("newer", func(t *testing.T) {
+		pt := newPeerTokenTest(t)
+		p := newTokenPeerIdentity(100, "100.64.0.100")
+		pt.b.handlePeerToken(viaDERP(p, pt.token(p, 10*time.Minute)))
+		if got := pt.checkTCP22(p); got != filter.Accept {
+			t.Fatalf("before: filter = %v; want Accept", got)
+		}
+		pt.b.handlePeerToken(viaDERP(p, pt.token(p, 15*time.Minute, noCaps)))
+		if pt.present(p) {
+			t.Error("peer still present after revocation")
+		}
+		if got := pt.checkTCP22(p); got != filter.Drop {
+			t.Errorf("after: filter = %v; want Drop", got)
+		}
+	})
+
+	t.Run("not_newer", func(t *testing.T) {
+		pt := newPeerTokenTest(t)
+		p := newTokenPeerIdentity(100, "100.64.0.100")
+		pt.b.handlePeerToken(viaDERP(p, pt.token(p, 10*time.Minute)))
+		pt.b.handlePeerToken(viaDERP(p, pt.token(p, 5*time.Minute, noCaps)))
+		if !pt.present(p) {
+			t.Error("older no-cap token revoked newer token")
+		}
+	})
+
+	t.Run("other_node_key", func(t *testing.T) {
+		pt := newPeerTokenTest(t)
+		p := newTokenPeerIdentity(100, "100.64.0.100")
+		pt.b.handlePeerToken(viaDERP(p, pt.token(p, 10*time.Minute)))
+		p2 := p
+		p2.node = key.NewNode().Public()
+		pt.b.handlePeerToken(viaDERP(p2, pt.token(p2, 15*time.Minute, noCaps)))
+		if !pt.present(p) {
+			t.Error("token for another node key revoked the peer's token")
+		}
+	})
+
+	t.Run("keeps_lookup", func(t *testing.T) {
+		lt := newPeerLookupTest(t)
+		p := newTokenPeerIdentity(100, "100.64.0.100")
+		lt.addControlPeer(p, "peer.example.ts.net.")
+		if _, err := lt.b.lookupPeerWait(t.Context(), lt.b.currentNode(), peerLookupQuery{ip: p.ip}); err != nil {
+			t.Fatal(err)
+		}
+		lt.b.handlePeerToken(viaDERP(p, lt.token(p, 10*time.Minute)))
+		lt.b.handlePeerToken(viaDERP(p, lt.token(p, 15*time.Minute, noCaps)))
+		// We can still contact it, but it has no access to us.
+		if !lt.present(p) {
+			t.Fatal("looked-up peer removed")
+		}
+		if lt.node(p).HasCap(testPeerCap) {
+			t.Error("peer kept its cap")
+		}
+		if got := lt.checkTCP22(p); got != filter.Drop {
+			t.Errorf("filter = %v; want Drop", got)
+		}
+	})
+}
+
+// TestUpdatePeerToken checks that a new peer token from control replaces
+// the netmap's, without a full netmap.
+func TestUpdatePeerToken(t *testing.T) {
+	b := newTestLocalBackend(t)
+	if b.UpdatePeerToken("a.b.c") {
+		t.Fatal("UpdatePeerToken succeeded with no netmap")
+	}
+
+	pt := newPeerTokenTest(t)
+	old := pt.b.currentNode().NetMap()
+	if !pt.b.UpdatePeerToken("a.b.c") {
+		t.Fatal("UpdatePeerToken failed")
+	}
+	nm := pt.b.currentNode().NetMap()
+	if nm.PeerToken != "a.b.c" {
+		t.Errorf("netmap PeerToken = %q; want a.b.c", nm.PeerToken)
+	}
+	if old.PeerToken != "" {
+		t.Error("old netmap was mutated")
+	}
+	if nm.SelfNode.ID() != old.SelfNode.ID() {
+		t.Error("netmap otherwise changed")
+	}
+}

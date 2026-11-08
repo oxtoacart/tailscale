@@ -36,6 +36,11 @@ type NetworkMap struct {
 
 	MachineKey key.MachinePublic
 
+	// PeerToken is this node's own peer token, the latest from
+	// [tailcfg.MapResponse.PeerToken], or empty if none. It's not written to
+	// the netmap disk cache, as it's short-lived.
+	PeerToken string
+
 	Peers []tailcfg.NodeView // sorted by Node.ID
 	DNS   tailcfg.DNSConfig
 

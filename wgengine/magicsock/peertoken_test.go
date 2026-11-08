@@ -5,6 +5,7 @@ package magicsock
 
 import (
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +14,6 @@ import (
 	"tailscale.com/disco"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tstime/mono"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -110,70 +110,32 @@ func TestPeerTokenRateLimited(t *testing.T) {
 	}
 }
 
-func selfWithPeerTokenCap(vals ...string) tailcfg.NodeView {
-	n := &tailcfg.Node{ID: 1, Key: key.NewNode().Public()}
-	if vals != nil {
-		raw := make([]tailcfg.RawMessage, len(vals))
-		for i, v := range vals {
-			raw[i] = tailcfg.RawMessage(v)
-		}
-		n.CapMap = tailcfg.NodeCapMap{nodecap.PeerToken: raw}
-	}
-	return n.View()
-}
-
-func TestPeerTokenFromSelf(t *testing.T) {
-	tooLong := `{"token":"` + strings.Repeat("x", disco.MaxPeerTokenLen+1) + `"}`
-	tests := []struct {
-		name    string
-		self    tailcfg.NodeView
-		want    string
-		wantErr bool
-	}{
-		{name: "invalid_self", self: tailcfg.NodeView{}},
-		{name: "absent", self: selfWithPeerTokenCap()},
-		{name: "one", self: selfWithPeerTokenCap(`{"token":"a.b.c"}`), want: "a.b.c"},
-		{name: "first_usable", self: selfWithPeerTokenCap(`{}`, tooLong, `{"token":"a.b.c"}`, `{"token":"d.e.f"}`), want: "a.b.c"},
-		{name: "none_usable", self: selfWithPeerTokenCap(`{"token":""}`, tooLong), wantErr: true},
-		{name: "malformed", self: selfWithPeerTokenCap(`"a.b.c"`), wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := peerTokenFromSelf(tt.self)
-			if string(got) != tt.want {
-				t.Errorf("got %q; want %q", got, tt.want)
-			}
-			if (err != nil) != tt.wantErr {
-				t.Errorf("err = %v; wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestUpdateSelfPeerToken(t *testing.T) {
+func TestSetSelfPeerToken(t *testing.T) {
 	c := newConn(t.Logf)
-	update := func(self tailcfg.NodeView) *selfPeerToken {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.updateSelfPeerTokenLocked(self)
+	set := func(token string) *selfPeerToken {
+		c.SetSelfPeerToken(token)
 		return c.selfPeerToken.Load()
 	}
-	if got := update(selfWithPeerTokenCap()); got != nil {
-		t.Fatalf("no cap: got %q", got.token)
+	if got := set(""); got != nil {
+		t.Fatalf("empty: got %q", got.token)
 	}
-	t1 := update(selfWithPeerTokenCap(`{"token":"a.b.c"}`))
+	t1 := set("a.b.c")
 	if t1 == nil || string(t1.token) != "a.b.c" {
 		t.Fatalf("got %v; want a.b.c", t1)
 	}
-	if got := update(selfWithPeerTokenCap(`{"token":"a.b.c"}`)); got != t1 {
+	if got := set("a.b.c"); got != t1 {
 		t.Error("unchanged token: pointer changed")
 	}
-	t2 := update(selfWithPeerTokenCap(`{"token":"d.e.f"}`))
+	t2 := set("d.e.f")
 	if t2 == t1 || string(t2.token) != "d.e.f" {
 		t.Errorf("changed token: got %v", t2)
 	}
-	if got := update(tailcfg.NodeView{}); got != nil {
-		t.Errorf("invalid self: got %q", got.token)
+	if got := set(strings.Repeat("x", disco.MaxPeerTokenLen+1)); got != nil {
+		t.Errorf("too long: got %d bytes", len(got.token))
+	}
+	set("a.b.c")
+	if got := set(""); got != nil {
+		t.Errorf("cleared: got %q", got.token)
 	}
 }
 
@@ -244,15 +206,12 @@ func TestPeerTokenSentOnContact(t *testing.T) {
 	const token = "a.b.c"
 	cleanupMesh := meshStacks(t.Logf, func(idx int, nm *netmap.NetworkMap) {
 		switch idx {
-		case 0:
-			self := nm.SelfNode.AsStruct()
-			self.CapMap = tailcfg.NodeCapMap{nodecap.PeerToken: {tailcfg.RawMessage(`{"token":"` + token + `"}`)}}
-			nm.SelfNode = self.View()
 		case 1:
 			nm.Peers = nil // m2 doesn't know m1
 		}
 	}, m1, m2)
 	defer cleanupMesh()
+	m1.conn.SetSelfPeerToken(token)
 
 	m1.tun.Outbound <- tuntest.Ping(m2.IP(), m1.IP())
 
@@ -289,15 +248,12 @@ func TestPresentPeerToken(t *testing.T) {
 	const token = "a.b.c"
 	cleanupMesh := meshStacks(t.Logf, func(idx int, nm *netmap.NetworkMap) {
 		switch idx {
-		case 0:
-			self := nm.SelfNode.AsStruct()
-			self.CapMap = tailcfg.NodeCapMap{nodecap.PeerToken: {tailcfg.RawMessage(`{"token":"` + token + `"}`)}}
-			nm.SelfNode = self.View()
 		case 1:
 			nm.Peers = nil // m2 doesn't know m1
 		}
 	}, m1, m2)
 	defer cleanupMesh()
+	m1.conn.SetSelfPeerToken(token)
 
 	// Wait for m1 to know m2, with its disco key.
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
@@ -342,4 +298,68 @@ func TestPresentPeerToken(t *testing.T) {
 
 	// Unknown peers are ignored.
 	m1.conn.PresentPeerToken(key.NewNode().Public())
+}
+
+// TestRenewedPeerTokenPresented checks that a new self peer token is
+// presented right away to the peers we've exchanged traffic with since we
+// last presented them one, but not to idle ones.
+func TestRenewedPeerTokenPresented(t *testing.T) {
+	derpMap, cleanup := runDERPAndStun(t, t.Logf, localhostListener{}, netaddr.IPv4(127, 0, 0, 1))
+	defer cleanup()
+
+	m1 := newMagicStack(t, logger.WithPrefix(t.Logf, "conn1: "), localhostListener{}, derpMap)
+	defer m1.Close()
+	m2 := newMagicStack(t, logger.WithPrefix(t.Logf, "conn2: "), localhostListener{}, derpMap)
+	defer m2.Close()
+
+	got := make(chan PeerTokenMessage, 100)
+	m2.conn.SetPeerTokenHandler(func(m PeerTokenMessage) { got <- m })
+	cleanupMesh := meshStacks(t.Logf, func(idx int, nm *netmap.NetworkMap) {
+		if idx == 1 {
+			nm.Peers = nil // m2 doesn't know m1
+		}
+	}, m1, m2)
+	defer cleanupMesh()
+
+	var de *endpoint
+	for deadline := time.Now().Add(10 * time.Second); de == nil || de.disco.Load() == nil; time.Sleep(10 * time.Millisecond) {
+		m1.conn.mu.Lock()
+		de, _ = m1.conn.peerMap.endpointForNodeKey(m2.Public())
+		m1.conn.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("m1 doesn't know m2")
+		}
+	}
+	// tokens returns the distinct tokens m2 receives within a second.
+	tokens := func() (toks []string) {
+		for {
+			select {
+			case m := <-got:
+				if !slices.Contains(toks, m.Token) {
+					toks = append(toks, m.Token)
+				}
+			case <-time.After(time.Second):
+				return toks
+			}
+		}
+	}
+
+	m1.conn.SetSelfPeerToken("a.b.c")
+	m1.conn.PresentPeerToken(m2.Public())
+	if toks := tokens(); !slices.Equal(toks, []string{"a.b.c"}) {
+		t.Fatalf("initial tokens = %q", toks)
+	}
+
+	// Idle since: the renewed token isn't presented.
+	m1.conn.SetSelfPeerToken("d.e.f")
+	if toks := tokens(); len(toks) != 0 {
+		t.Errorf("idle peer got tokens %q", toks)
+	}
+
+	// After traffic, it is.
+	de.lastRecvWG.StoreAtomic(mono.Now())
+	m1.conn.SetSelfPeerToken("g.h.i")
+	if toks := tokens(); !slices.Equal(toks, []string{"g.h.i"}) {
+		t.Errorf("active peer got tokens %q; want [g.h.i]", toks)
+	}
 }
