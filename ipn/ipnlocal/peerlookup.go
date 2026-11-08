@@ -26,6 +26,7 @@ import (
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
+	"tailscale.com/wgengine"
 )
 
 // This file implements finding peers that aren't in the netmap from control,
@@ -574,18 +575,34 @@ func (nb *nodeBackend) forgetLookupResult(id tailcfg.NodeID, expiry time.Time) (
 // MagicDNS resolver for names that no peer has.
 func (b *LocalBackend) lookupPeerForDNS(fqdn dnsname.FQDN) (ips []netip.Addr, ok bool) {
 	nb := b.currentNode()
-	name := strings.ToLower(fqdn.WithoutTrailingDot())
-	suffix := strings.ToLower(strings.TrimSuffix(nb.NetMap().MagicDNSSuffix(), "."))
-	base, ok := strings.CutSuffix(name, "."+suffix)
-	if suffix == "" || !ok || base == "" || strings.Contains(base, ".") {
-		return nil, false
-	}
-	ctx, cancel := context.WithTimeout(nb.ctx, peerLookupDNSTimeout)
-	defer cancel()
-	if _, err := b.lookupPeerWait(ctx, nb, peerLookupQuery{name: name}); err != nil {
+	if !b.lookupPeerByName(nb, string(fqdn), false) {
 		return nil, false
 	}
 	return nb.magicDNSHostAddrs(fqdn)
+}
+
+// lookupPeerByName looks up the peer with the MagicDNS name name, if it's a
+// single label in the self node's MagicDNS domain ("pi.foo.ts.net", with or
+// without a trailing dot) or, if allowBare, a bare name ("pi"), which is
+// taken to be in that domain. It waits up to peerLookupDNSTimeout, and
+// reports whether it found the peer.
+func (b *LocalBackend) lookupPeerByName(nb *nodeBackend, name string, allowBare bool) bool {
+	suffix := strings.ToLower(strings.TrimSuffix(nb.NetMap().MagicDNSSuffix(), "."))
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	if suffix == "" || name == "" {
+		return false
+	}
+	if allowBare && !strings.Contains(name, ".") {
+		name += "." + suffix
+	}
+	base, ok := strings.CutSuffix(name, "."+suffix)
+	if !ok || base == "" || strings.Contains(base, ".") {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(nb.ctx, peerLookupDNSTimeout)
+	defer cancel()
+	_, err := b.lookupPeerWait(ctx, nb, peerLookupQuery{name: name})
+	return err == nil
 }
 
 // HasNodeAddr reports whether a node (self or peer) in nb has the Tailscale
@@ -593,4 +610,28 @@ func (b *LocalBackend) lookupPeerForDNS(fqdn dnsname.FQDN) (ips []netip.Addr, ok
 func (nb *nodeBackend) HasNodeAddr(ip netip.Addr) bool {
 	_, ok := nb.NodeByAddr(ip)
 	return ok
+}
+
+// PeerForIPWithLookup is like [LocalBackend.PeerForIP], but if no node has
+// the Tailscale IP ip, it first waits briefly to look up the peer with
+// control, if we may (see peerlookup.go).
+//
+// It's for dialers that only dial Tailscale IPs of known peers via
+// netstack, as tailscaled does in userspace-networking mode, and tsnet
+// does. Without it, they'd dial the IP of a peer we haven't found yet on
+// the host's network instead, and so never find the peer.
+func (b *LocalBackend) PeerForIPWithLookup(ip netip.Addr) (_ wgengine.PeerForIP, ok bool) {
+	if p, ok := b.PeerForIP(ip); ok {
+		return p, true
+	}
+	if !tsaddr.IsTailscaleIP(ip) || ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
+		return wgengine.PeerForIP{}, false
+	}
+	nb := b.currentNode()
+	ctx, cancel := context.WithTimeout(nb.ctx, peerLookupDNSTimeout)
+	defer cancel()
+	if _, err := b.lookupPeerWait(ctx, nb, peerLookupQuery{ip: ip}); err != nil {
+		return wgengine.PeerForIP{}, false
+	}
+	return b.PeerForIP(ip)
 }

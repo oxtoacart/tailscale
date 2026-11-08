@@ -514,3 +514,56 @@ func TestPeerLookupRoutesAllTailscaleIPs(t *testing.T) {
 		}
 	}
 }
+
+// TestPeerLookupResolveMagicDNS checks that the userspace dialer's MagicDNS
+// resolution (used by the SOCKS5 and HTTP proxies) looks up peers it
+// doesn't have, by bare or fully qualified name, but not other names.
+func TestPeerLookupResolveMagicDNS(t *testing.T) {
+	for _, name := range []string{"peer", "peer.example.ts.net"} {
+		lt := newPeerLookupTest(t)
+		p := newTokenPeerIdentity(100, "100.64.0.100")
+		lt.addControlPeer(p, "peer.example.ts.net.")
+		ip, ok := lt.b.resolveMagicDNS(name, "tcp")
+		if !ok || ip != p.ip {
+			t.Errorf("resolveMagicDNS(%q) = %v, %v; want %v", name, ip, ok, p.ip)
+		}
+		if req := lt.requests[0]; req.Name != "peer.example.ts.net" {
+			t.Errorf("resolveMagicDNS(%q): lookup of %q", name, req.Name)
+		}
+	}
+
+	lt := newPeerLookupTest(t)
+	for _, name := range []string{"example.com", "peer.other.ts.net", "a.peer.example.ts.net"} {
+		if _, ok := lt.b.resolveMagicDNS(name, "tcp"); ok {
+			t.Errorf("resolveMagicDNS(%q) resolved", name)
+		}
+	}
+	if got := lt.numRequests(); got != 0 {
+		t.Errorf("lookups of other names = %d; want 0", got)
+	}
+}
+
+// TestPeerForIPWithLookup checks that PeerForIPWithLookup looks up peers it
+// doesn't have, by Tailscale IP, but not other IPs.
+func TestPeerForIPWithLookup(t *testing.T) {
+	lt := newPeerLookupTest(t)
+	p := newTokenPeerIdentity(100, "100.64.0.100")
+	lt.addControlPeer(p, "peer.example.ts.net.")
+
+	if _, ok := lt.b.PeerForIP(p.ip); ok {
+		t.Fatal("PeerForIP found peer before lookup")
+	}
+	got, ok := lt.b.PeerForIPWithLookup(p.ip)
+	if !ok || got.Node.Key() != p.node || got.IsSelf {
+		t.Fatalf("PeerForIPWithLookup = %+v, %v", got, ok)
+	}
+
+	for _, ip := range []string{"192.168.0.1", "100.100.100.100"} {
+		if _, ok := lt.b.PeerForIPWithLookup(netip.MustParseAddr(ip)); ok {
+			t.Errorf("PeerForIPWithLookup(%s) found something", ip)
+		}
+	}
+	if got := lt.numRequests(); got != 1 {
+		t.Errorf("lookups = %d; want 1", got)
+	}
+}

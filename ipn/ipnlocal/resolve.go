@@ -60,8 +60,19 @@ func (b *LocalBackend) peerConfig(k key.NodePublic) (_ wgcfg.PeerConfig, ok bool
 // short names ("foo"), and DNS.ExtraRecords entries (service VIPs).
 // The hostname must be lowercase with no trailing dot. It is installed
 // as the [tsdial.Dialer.SetResolveMagicDNS] callback.
+//
+// If no peer has the name, and it may be one (it's a bare name or in our
+// MagicDNS domain), it waits briefly to look up the peer with control, as
+// we may only find peers by looking them up. That matters most in
+// userspace-networking mode, where apps reach peers by name through our
+// SOCKS5 and HTTP proxies, and the OS's resolver can't resolve the name.
 func (b *LocalBackend) resolveMagicDNS(hostname, network string) (_ netip.Addr, ok bool) {
 	nb := b.currentNode()
+	if _, ok := nb.NodeByName(hostname); !ok {
+		if _, ok := nb.ExtraDNSByName(hostname); !ok {
+			b.lookupPeerByName(nb, hostname, true)
+		}
+	}
 	if nid, ok := nb.NodeByName(hostname); ok {
 		n, ok := nb.NodeByID(nid)
 		if !ok {
