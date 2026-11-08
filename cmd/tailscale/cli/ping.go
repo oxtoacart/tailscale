@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/local"
 	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/ipn/ipnstate"
@@ -192,6 +193,52 @@ func runPing(ctx context.Context, args []string) error {
 	}
 }
 
+// magicDNSIPFromArg resolves host, a bare name ("pi") or a fully qualified
+// name in the current tailnet's MagicDNS domain ("pi.foo.ts.net", with or
+// without a trailing dot), with tailscaled's MagicDNS resolver, preferring
+// IPv4. It reports false if host isn't such a name, or isn't found.
+func magicDNSIPFromArg(ctx context.Context, st *ipnstate.Status, host string) (ip string, ok bool) {
+	if st.CurrentTailnet == nil || st.CurrentTailnet.MagicDNSSuffix == "" {
+		return "", false
+	}
+	suffix := strings.ToLower(strings.TrimSuffix(st.CurrentTailnet.MagicDNSSuffix, "."))
+	name := strings.ToLower(strings.TrimSuffix(host, "."))
+	if name == "" {
+		return "", false
+	}
+	if !strings.Contains(name, ".") {
+		name += "." + suffix
+	} else if !strings.HasSuffix(name, "."+suffix) {
+		return "", false
+	}
+	for _, typ := range []string{"A", "AAAA"} {
+		res, _, err := localClient.QueryDNS(ctx, name, typ)
+		if err != nil {
+			continue
+		}
+		var p dnsmessage.Parser
+		if h, err := p.Start(res); err != nil || h.RCode != dnsmessage.RCodeSuccess {
+			continue
+		}
+		if err := p.SkipAllQuestions(); err != nil {
+			continue
+		}
+		answers, err := p.AllAnswers()
+		if err != nil {
+			continue
+		}
+		for _, a := range answers {
+			switch r := a.Body.(type) {
+			case *dnsmessage.AResource:
+				return netip.AddrFrom4(r.A).String(), true
+			case *dnsmessage.AAAAResource:
+				return netip.AddrFrom16(r.AAAA).String(), true
+			}
+		}
+	}
+	return "", false
+}
+
 func tailscaleIPFromArg(ctx context.Context, hostOrIP string) (ip string, self bool, err error) {
 	// If the argument is an IP address, use it directly without any resolution.
 	if net.ParseIP(hostOrIP) != nil {
@@ -216,6 +263,15 @@ func tailscaleIPFromArg(ctx context.Context, hostOrIP string) (ip string, self b
 	}
 	if match(st.Self) && len(st.Self.TailscaleIPs) > 0 {
 		return st.Self.TailscaleIPs[0].String(), true, nil
+	}
+
+	// Then ask tailscaled's MagicDNS, if the name may be in our tailnet.
+	// Peers aren't necessarily in the status: tailscaled may find them only
+	// when they're looked up, as when control relies on peer tokens and sends
+	// no peers. And MagicDNS may not be the OS's resolver, as with
+	// --accept-dns=false or userspace networking.
+	if ip, ok := magicDNSIPFromArg(ctx, st, hostOrIP); ok {
+		return ip, false, nil
 	}
 
 	// Finally, use DNS.

@@ -770,7 +770,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 	}
 	if onlyNetstack {
 		dialer.UseNetstackForIP = func(ip netip.Addr) bool {
-			_, ok := lb.PeerForIP(ip)
+			_, ok := lb.PeerForIPWithLookup(ip)
 			return ok
 		}
 	}

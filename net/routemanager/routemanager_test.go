@@ -254,6 +254,41 @@ func TestOneCGNAT(t *testing.T) {
 	wantOSRoutes(t, rm, "100.64.0.1/32", "fd7a:115c:a1e0::/48")
 }
 
+// TestAllTailscaleIPs checks that with TailnetConfig.AllTailscaleIPs, the OS
+// route set has the whole Tailscale IP ranges, even with no peers, and keeps
+// them as peers come and go, on both the incremental and full-rebuild paths.
+func TestAllTailscaleIPs(t *testing.T) {
+	rm := New(t.Logf)
+	res := commit(rm, func(m *Mutation) {
+		m.SetTailnetConfig(TailnetConfig{AllTailscaleIPs: true})
+	})
+	if !res.OSRoutesChanged {
+		t.Errorf("enabling with no peers: %+v", res)
+	}
+	wantOSRoutes(t, rm, "100.64.0.0/10", "fd7a:115c:a1e0::/48")
+
+	// Peers (incrementally) don't add their own routes, nor does removing
+	// them remove the ranges.
+	commit(rm, func(m *Mutation) { m.upsertPeer(peer1()) })
+	wantOSRoutes(t, rm, "100.64.0.0/10", "fd7a:115c:a1e0::/48")
+	wantOutbound(t, rm, "100.64.0.1", k1, true)
+	commit(rm, func(m *Mutation) { m.RemovePeer(1) })
+	wantOSRoutes(t, rm, "100.64.0.0/10", "fd7a:115c:a1e0::/48")
+
+	// A full rebuild keeps them.
+	commit(rm, func(m *Mutation) { m.SetPrefs(Prefs{RouteAll: true}) })
+	wantOSRoutes(t, rm, "100.64.0.0/10", "fd7a:115c:a1e0::/48")
+
+	// Disabling it goes back to per-peer routes.
+	commit(rm, func(m *Mutation) {
+		m.upsertPeer(peer1())
+		m.SetTailnetConfig(TailnetConfig{})
+	})
+	wantOSRoutes(t, rm, "100.64.0.1/32", "fd7a:115c:a1e0::/48")
+	commit(rm, func(m *Mutation) { m.RemovePeer(1) })
+	wantOSRoutes(t, rm)
+}
+
 // TestFullRebuildWhileCoarse exercises the full-rebuild path (a prefs
 // change) while CGNAT coarsening is already active.
 func TestFullRebuildWhileCoarse(t *testing.T) {

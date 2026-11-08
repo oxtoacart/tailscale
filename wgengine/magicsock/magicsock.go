@@ -55,6 +55,7 @@ import (
 	"tailscale.com/tsconst"
 	"tailscale.com/tstime"
 	"tailscale.com/tstime/mono"
+	"tailscale.com/tstime/rate"
 	"tailscale.com/types/key"
 	"tailscale.com/types/lazy"
 	"tailscale.com/types/logger"
@@ -276,6 +277,16 @@ type Conn struct {
 	// discoAtomic is the current disco private and public keypair for this conn.
 	discoAtomic discoAtomic
 
+	// peerTokenHandler, if non-nil, receives [disco.PeerToken] messages,
+	// including from senders not in the netmap. See [Conn.SetPeerTokenHandler].
+	peerTokenHandler syncs.AtomicValue[func(PeerTokenMessage)]
+
+	// selfPeerToken is this node's own peer token (see
+	// [Conn.SetSelfPeerToken]), or nil if it has none. A new pointer is stored only when the
+	// token changes, so endpoints compare pointers to tell whether they've
+	// sent the current token. See [endpoint.maybeSendPeerTokenLocked].
+	selfPeerToken atomic.Pointer[selfPeerToken]
+
 	// usingCacheNetmap is whether the latest update to self and peersByID are from a cached network map.
 	usingCachedNetmap atomic.Bool
 
@@ -340,6 +351,10 @@ type Conn struct {
 
 	// discoInfo is the state for an active peer DiscoKey.
 	discoInfo map[key.DiscoPublic]*discoInfo
+
+	// peerTokenLimiter rate limits processing of [disco.PeerToken]
+	// messages. It is lazily initialized.
+	peerTokenLimiter *rate.Limiter
 
 	// netInfoFunc is a callback that provides a tailcfg.NetInfo when
 	// discovered network conditions change.
@@ -1183,6 +1198,24 @@ func (c *Conn) LastRecvActivityOfNodeKey(nk key.NodePublic) string {
 		return "never"
 	}
 	return mono.Since(saw).Round(time.Second).String()
+}
+
+// SinceLastSendToNodeKey returns how long ago WireGuard (or "tailscale
+// ping") last sent a packet to the peer with node key nk. It reports false
+// if nk isn't a peer, or nothing has been sent to it.
+func (c *Conn) SinceLastSendToNodeKey(nk key.NodePublic) (_ time.Duration, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	de, ok := c.peerMap.endpointForNodeKey(nk)
+	if !ok {
+		return 0, false
+	}
+	de.mu.Lock()
+	defer de.mu.Unlock()
+	if de.lastSendExt.IsZero() {
+		return 0, false
+	}
+	return mono.Since(de.lastSendExt), true
 }
 
 // ProbeLocks acquires and releases Conn's internal mutex.
@@ -2250,6 +2283,11 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 	case c.peerMap.knownPeerDiscoKey(sender):
 		di = c.discoInfoForKnownPeerLocked(sender)
 	default:
+		// The only message we accept from unknown senders is a
+		// PeerToken, which may authorize the sender as a new peer.
+		if c.handleUnknownSenderDiscoLocked(msg, sender, src, derpNodeSrc) {
+			return
+		}
 		metricRecvDiscoBadPeer.Add(1)
 		if debugDisco() {
 			c.logf("magicsock: disco: ignoring disco-looking frame, don't know of key %v", sender.ShortString())
@@ -2332,6 +2370,12 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 	}
 
 	switch dm := dm.(type) {
+	case *disco.PeerToken:
+		// A known peer refreshing its token (or one we learned of
+		// via a previous token, renewing it).
+		if fn := c.peerTokenHandler.Load(); fn != nil && !src.vni.IsSet() && c.allowPeerTokenLocked() {
+			c.dispatchPeerTokenLocked(fn, dm, sender, src, derpNodeSrc)
+		}
 	case *disco.Ping:
 		metricRecvDiscoPing.Add(1)
 		c.handlePingLocked(dm, src, di, derpNodeSrc)

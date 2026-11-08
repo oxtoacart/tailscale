@@ -199,7 +199,8 @@ type CapabilityVersion int
 //   - 148: 2026-09-15: Client understands [Node.StableTailnetID]
 //   - 149: 2026-10-07: Sentinel version to request the server send back [NodeAttrCacheNetworkMaps] set to enabled
 //   - 150: 2026-10-13: Client handles app connectors with "mode": "magicip" as conn25.
-const CurrentCapabilityVersion CapabilityVersion = 150
+//   - 151: 2026-11-08: Client handles [MapResponse.PeerToken]
+const CurrentCapabilityVersion CapabilityVersion = 151
 
 // ID is an integer ID for a user, node, or login allocated by the
 // control plane.
@@ -2206,6 +2207,18 @@ type MapResponse struct {
 	// or nothing to report.
 	ClientVersion *ClientVersion `json:",omitempty"`
 
+	// PeerToken, if non-empty, is this node's new peer token (see package
+	// tailscale.com/ipn/peertoken): a compact serialized JWT, signed by
+	// control, that the node presents in a disco PeerToken message to peers
+	// it contacts, so that peers which control didn't put this node in the
+	// netmap of can still accept connections from it. An empty value means
+	// no change. Control sends a new one before the current one expires.
+	//
+	// It's a MapResponse field rather than a self node capability so that
+	// control can renew a token without sending (or the client rebuilding
+	// its netmap for) the whole self node.
+	PeerToken string `json:",omitempty"`
+
 	// DeprecatedDefaultAutoUpdate is the default node auto-update setting for this
 	// tailnet. The node is free to opt-in or out locally regardless of this
 	// value. Once this value has been set and stored in the client, future
@@ -3027,6 +3040,51 @@ type TokenResponse struct {
 	//   `user`      | user emailish (like alice.github:alice@github or example.com:bob@example.com), if not tagged
 	//   `uid`       | user ID, if not tagged
 	IDToken string `json:"id_token"`
+}
+
+// PeerLookupRequest asks control for the details a node needs to contact a
+// peer that isn't in its netmap, such as when control relies on peer tokens
+// (see package tailscale.com/ipn/peertoken) rather than sending peers.
+//
+// It is JSON-encoded and sent over Noise to "POST /machine/peer-lookup",
+// which control only serves to nodes with the [nodecap.PeerLookup]
+// capability.
+//
+// Exactly one of IP or Name must be set.
+//
+// [nodecap.PeerLookup]: https://pkg.go.dev/tailscale.com/tailcfg/nodecap#PeerLookup
+type PeerLookupRequest struct {
+	// Version is the client's current CapabilityVersion.
+	Version CapabilityVersion
+
+	// NodeKey is the client's current node key.
+	NodeKey key.NodePublic
+
+	// IP, if valid, is a Tailscale IP address of the peer to look up.
+	IP netip.Addr `json:",omitzero"`
+
+	// Name, if non-empty, is the MagicDNS name of the peer to look up: either
+	// a fully qualified name in the requester's tailnet ("pi.foo.ts.net",
+	// with or without a trailing dot) or a bare name ("pi").
+	Name string `json:",omitempty"`
+}
+
+// PeerLookupResponse is the response to a [PeerLookupRequest].
+//
+// If there's no such peer, control responds with HTTP status 404 instead.
+type PeerLookupResponse struct {
+	// Node is the peer. Only the fields needed to contact it are set: ID,
+	// StableID, Name, Key, KeyExpiry, DiscoKey, Addresses, AllowedIPs,
+	// HomeDERP, Endpoints and Cap.
+	//
+	// Being returned doesn't mean the requester may access the peer; the
+	// peer decides that from the requester's peer token.
+	Node *Node
+
+	// TTLSeconds is how long the requester may use Node before it must look
+	// the peer up again, as the peer's endpoints and home DERP region may
+	// change.
+	TTLSeconds int
 }
 
 // PeerChange is an update to a node.

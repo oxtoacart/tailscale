@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go4.org/netipx"
 	"tailscale.com/feature/buildfeatures"
@@ -25,6 +26,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/tailcfg/peercap"
+	"tailscale.com/tstime/rate"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -35,6 +37,7 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/set"
+	"tailscale.com/util/singleflight"
 	"tailscale.com/util/slicesx"
 	"tailscale.com/util/testenv"
 	"tailscale.com/wgengine/filter"
@@ -163,6 +166,37 @@ type nodeBackend struct {
 	// JSON-encoding of a NetMap snapshot doesn't race with writes.
 	packetFilterRules views.Slice[tailcfg.FilterRule]
 	packetFilter      []filter.Match
+
+	// tokenPeerFilter are the packet filter matches for peers authorized
+	// by peer tokens, derived from the "cap:..." keys of the self node's
+	// CapMap in the most recent full netmap. See
+	// [peertoken.FilterRulesFromSelfCapMap].
+	tokenPeerFilter []filter.Match
+
+	// packetFilterWithTokenPeers caches packetFilter+tokenPeerFilter, so
+	// that [nodeBackend.packetFilterWithTokenPeerRules] returns the same
+	// slice until either input changes (LocalBackend's filter change
+	// detection relies on slice identity). It's nil when stale.
+	packetFilterWithTokenPeers []filter.Match
+
+	// localPeers are the peers we learned of via peer tokens or peer
+	// lookups rather than from control's netmap, keyed by node ID. Each is
+	// also present in peers (and the indexes derived from it) while its
+	// token or lookup result is valid, unless control has since told us
+	// about the same node ID.
+	localPeers map[tailcfg.NodeID]*localPeer
+
+	// peerLookups deduplicates concurrent lookups of peers with control
+	// (see peerlookup.go).
+	peerLookups singleflight.Group[peerLookupQuery, tailcfg.NodeView]
+
+	// peerLookupFailures is when each recently failed peer lookup failed,
+	// so that we don't repeat it too often.
+	peerLookupFailures map[peerLookupQuery]time.Time
+
+	// peerLookupLimiter limits how often we look up peers; it's created
+	// lazily.
+	peerLookupLimiter *rate.Limiter
 
 	// keyWaitersForTest is the test-only registry of channels waiting for
 	// a given peer key to first appear in the netmap. See
@@ -668,6 +702,7 @@ func (nb *nodeBackend) SetNetMap(nm *netmap.NetworkMap) (discoChanged []key.Node
 		nb.packetFilter = nil
 		nb.derpMapViewPub.Publish(tailcfg.DERPMapView{})
 	}
+	nb.updateTokenPeerFilterLocked()
 	return discoChanged, routeChanged
 }
 
@@ -941,6 +976,11 @@ type routePrefs struct {
 	// OneCGNAT is whether the OS route set should collapse peers'
 	// CGNAT addresses into the single /10 route.
 	OneCGNAT bool
+
+	// AllTailscaleIPs is whether the OS route set should always have the
+	// whole Tailscale IP ranges; see
+	// [routemanager.TailnetConfig.AllTailscaleIPs].
+	AllTailscaleIPs bool
 }
 
 // updateRouteManagerPrefs pushes p into the route manager.
@@ -966,7 +1006,7 @@ func (nb *nodeBackend) updateRouteManagerPrefs(p routePrefs) routemanager.PeersW
 		ExitNodeSelected: p.ExitNodeSelected,
 		RouteAll:         p.RouteAll,
 	})
-	rt.SetTailnetConfig(routemanager.TailnetConfig{OneCGNAT: p.OneCGNAT})
+	rt.SetTailnetConfig(routemanager.TailnetConfig{OneCGNAT: p.OneCGNAT, AllTailscaleIPs: p.AllTailscaleIPs})
 	res := rt.Commit()
 	return res.AllowedIPs
 }
@@ -1013,6 +1053,7 @@ func (nb *nodeBackend) setPacketFilter(rules views.Slice[tailcfg.FilterRule], pa
 	defer nb.mu.Unlock()
 	nb.packetFilterRules = rules
 	nb.packetFilter = parsed
+	nb.packetFilterWithTokenPeers = nil
 }
 
 // PacketFilter returns the current live packet filter matches.

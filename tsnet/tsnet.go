@@ -950,7 +950,7 @@ func (s *Server) start() (reterr error) {
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		// s.lb is assigned below, before any dials can happen.
-		_, ok := s.lb.PeerForIP(ip)
+		_, ok := s.lb.PeerForIPWithLookup(ip)
 		return ok
 	}
 	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {

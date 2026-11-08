@@ -241,6 +241,17 @@ type NetmapDeltaUpdater interface {
 	UpdateNetmapDelta([]netmap.NodeMutation) (ok bool)
 }
 
+// PeerTokenUpdater is an optional interface that can be implemented by
+// NetmapUpdater implementations to receive a new
+// [tailcfg.MapResponse.PeerToken] without a full netmap rebuild.
+type PeerTokenUpdater interface {
+	// UpdatePeerToken is called with this node's new peer token.
+	//
+	// It returns false to signal the caller to fall back to a full netmap
+	// rebuild (which carries the token in [netmap.NetworkMap.PeerToken]).
+	UpdatePeerToken(token string) bool
+}
+
 // PacketFilterUpdater is an optional interface that can be implemented by
 // NetmapUpdater implementations to receive incremental packet-filter updates
 // without a full netmap rebuild.

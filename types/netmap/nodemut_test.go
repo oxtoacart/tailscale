@@ -63,6 +63,9 @@ func TestMapResponseContainsNonPatchFields(t *testing.T) {
 		case "UserProfiles":
 			// Now delivered separately via UserProfileUpdater.
 			want = false
+		case "PeerToken":
+			// Delivered separately via PeerTokenUpdater.
+			want = false
 		default:
 			// Everything else should be conseratively handled as a
 			// non-delta field. We want it to return true so if

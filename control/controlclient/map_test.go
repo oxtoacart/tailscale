@@ -1712,3 +1712,85 @@ func TestPeerIDAndKeyByTailscaleIP(t *testing.T) {
 		}
 	})
 }
+
+type peerTokenRecordingUpdater struct {
+	countingDeltaNetmapUpdater
+	lastFull *netmap.NetworkMap
+	tokens   []string
+}
+
+func (nu *peerTokenRecordingUpdater) UpdateFullNetmap(nm *netmap.NetworkMap) {
+	nu.countingDeltaNetmapUpdater.UpdateFullNetmap(nm)
+	nu.lastFull = nm
+}
+
+func (nu *peerTokenRecordingUpdater) UpdatePeerToken(token string) bool {
+	nu.tokens = append(nu.tokens, token)
+	return true
+}
+
+// TestPeerTokenHandledIncrementally checks that a MapResponse carrying just
+// a new PeerToken is delivered to a PeerTokenUpdater without a full netmap
+// rebuild, and that full netmaps carry the latest token.
+func TestPeerTokenHandledIncrementally(t *testing.T) {
+	nu := &peerTokenRecordingUpdater{}
+	ms := newTestMapSession(t, nu)
+	ctx := t.Context()
+
+	if err := ms.HandleNonKeepAliveMapResponse(ctx, &tailcfg.MapResponse{
+		Node:      &tailcfg.Node{Name: "self.example.ts.net."},
+		PeerToken: "a.b.c",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nu.full.Load(); got != 1 {
+		t.Fatalf("full updates = %d; want 1", got)
+	}
+	if nu.lastFull.PeerToken != "a.b.c" {
+		t.Errorf("full netmap PeerToken = %q; want a.b.c", nu.lastFull.PeerToken)
+	}
+
+	// A renewal alone is handled incrementally.
+	if err := ms.HandleNonKeepAliveMapResponse(ctx, &tailcfg.MapResponse{PeerToken: "d.e.f"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nu.full.Load(); got != 1 {
+		t.Errorf("full updates after renewal = %d; want 1", got)
+	}
+	if len(nu.tokens) != 1 || nu.tokens[0] != "d.e.f" {
+		t.Errorf("incremental tokens = %q; want [d.e.f]", nu.tokens)
+	}
+
+	// The next full netmap has the renewed token, as does one after a
+	// response that doesn't mention it.
+	if err := ms.HandleNonKeepAliveMapResponse(ctx, &tailcfg.MapResponse{
+		Node: &tailcfg.Node{Name: "self2.example.ts.net."},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nu.full.Load(); got != 2 {
+		t.Fatalf("full updates = %d; want 2", got)
+	}
+	if nu.lastFull.PeerToken != "d.e.f" {
+		t.Errorf("full netmap PeerToken = %q; want d.e.f", nu.lastFull.PeerToken)
+	}
+}
+
+// TestPeerTokenWithoutUpdater checks that a new PeerToken falls back to a
+// full netmap rebuild if the updater can't take it incrementally.
+func TestPeerTokenWithoutUpdater(t *testing.T) {
+	nu := &countingDeltaNetmapUpdater{}
+	ms := newTestMapSession(t, nu)
+	ctx := t.Context()
+	if err := ms.HandleNonKeepAliveMapResponse(ctx, &tailcfg.MapResponse{
+		Node: &tailcfg.Node{Name: "self.example.ts.net."},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.HandleNonKeepAliveMapResponse(ctx, &tailcfg.MapResponse{PeerToken: "a.b.c"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := nu.full.Load(); got != 2 {
+		t.Errorf("full updates = %d; want 2", got)
+	}
+}

@@ -38,6 +38,9 @@ func (b *LocalBackend) lookupPeerByIP(ip netip.Addr) (key.NodePublic, bool) {
 	if pr, ok := nb.routeMgr.Outbound().Lookup(ip); ok {
 		return pr.Key, true
 	}
+	// Control may not have told us about the peer; ask it, for later
+	// packets.
+	b.maybeLookupPeerByIPAsync(nb, ip)
 	return key.NodePublic{}, false
 }
 
@@ -57,8 +60,19 @@ func (b *LocalBackend) peerConfig(k key.NodePublic) (_ wgcfg.PeerConfig, ok bool
 // short names ("foo"), and DNS.ExtraRecords entries (service VIPs).
 // The hostname must be lowercase with no trailing dot. It is installed
 // as the [tsdial.Dialer.SetResolveMagicDNS] callback.
+//
+// If no peer has the name, and it may be one (it's a bare name or in our
+// MagicDNS domain), it waits briefly to look up the peer with control, as
+// we may only find peers by looking them up. That matters most in
+// userspace-networking mode, where apps reach peers by name through our
+// SOCKS5 and HTTP proxies, and the OS's resolver can't resolve the name.
 func (b *LocalBackend) resolveMagicDNS(hostname, network string) (_ netip.Addr, ok bool) {
 	nb := b.currentNode()
+	if _, ok := nb.NodeByName(hostname); !ok {
+		if _, ok := nb.ExtraDNSByName(hostname); !ok {
+			b.lookupPeerByName(nb, hostname, true)
+		}
+	}
 	if nid, ok := nb.NodeByName(hostname); ok {
 		n, ok := nb.NodeByID(nid)
 		if !ok {
@@ -90,7 +104,12 @@ func (m magicDNSHosts) LookupHost(fqdn dnsname.FQDN) (ips []netip.Addr, ok bool)
 	if !buildfeatures.HasDNS {
 		return nil, false
 	}
-	return m.b.currentNode().magicDNSHostAddrs(fqdn)
+	if ips, ok := m.b.currentNode().magicDNSHostAddrs(fqdn); ok {
+		return ips, true
+	}
+	// Control may not have told us about the peer; ask it. This blocks
+	// the query briefly, but only for names in our tailnet's domain.
+	return m.b.lookupPeerForDNS(fqdn)
 }
 
 func (m magicDNSHosts) LookupPTR(ip netip.Addr) (_ dnsname.FQDN, ok bool) {

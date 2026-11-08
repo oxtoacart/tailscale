@@ -140,6 +140,14 @@ type TailnetConfig struct {
 	// caller (it depends on platform and interface state); the
 	// RouteManager just applies it.
 	OneCGNAT bool
+
+	// AllTailscaleIPs is whether the OS route set should always include
+	// the whole CGNAT /10 and Tailscale ULA /48, whether or not any peers
+	// have addresses in them. It's for nodes that find peers on demand
+	// (by looking them up with control) rather than from the netmap: the
+	// OS must send them packets for Tailscale IPs of peers they don't know
+	// yet, so that they can look the peers up.
+	AllTailscaleIPs bool
 }
 
 // cgnatThreshold is the number of distinct CGNAT self-address routes
@@ -891,6 +899,12 @@ func (rm *RouteManager) cgnatThreshold() int {
 	return cgnatThreshold
 }
 
+// wantCoarseCGNAT reports whether the OS route set should have the single
+// CGNAT /10 route rather than per-peer routes.
+func (rm *RouteManager) wantCoarseCGNAT() bool {
+	return len(rm.cgnatPfxs) > rm.cgnatThreshold() || rm.cfg.AllTailscaleIPs
+}
+
 // tableSet returns a table derived from t, in which pfx's presence
 // matches want, reporting whether the result table differs from t.
 func tableSet(t *bart.Lite, pfx netip.Prefix, want bool) (*bart.Lite, bool) {
@@ -961,10 +975,10 @@ func (rm *RouteManager) applyDirty(dirty set.Set[netip.Prefix], res *Result) {
 
 	var ch bool
 	_, advULA := rm.desiredFor(tsaddr.TailscaleULARange())
-	osr, ch = tableSet(osr, tsaddr.TailscaleULARange(), advULA || len(rm.ulaPfxs) > 0)
+	osr, ch = tableSet(osr, tsaddr.TailscaleULARange(), advULA || len(rm.ulaPfxs) > 0 || rm.cfg.AllTailscaleIPs)
 	osChanged = osChanged || ch
 
-	wantCoarse := len(rm.cgnatPfxs) > rm.cgnatThreshold()
+	wantCoarse := rm.wantCoarseCGNAT()
 	if wantCoarse != rm.coarseCGNAT {
 		rm.coarseCGNAT = wantCoarse
 		for pfx := range rm.cgnatPfxs {
@@ -1022,10 +1036,10 @@ func (rm *RouteManager) rebuildAll(res *Result) {
 			osr.Insert(pfx)
 		}
 	}
-	if len(rm.ulaPfxs) > 0 {
+	if len(rm.ulaPfxs) > 0 || rm.cfg.AllTailscaleIPs {
 		osr.Insert(tsaddr.TailscaleULARange())
 	}
-	rm.coarseCGNAT = len(rm.cgnatPfxs) > rm.cgnatThreshold()
+	rm.coarseCGNAT = rm.wantCoarseCGNAT()
 	if rm.coarseCGNAT {
 		osr.Insert(tsaddr.CGNATRange())
 	} else {
